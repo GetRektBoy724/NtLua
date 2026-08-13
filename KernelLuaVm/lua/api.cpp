@@ -12,12 +12,36 @@ static void export_func( lua_State* L, const char* name, const void* ptr )
     lua_setglobal( L, name );
 }
 
-// Read / Write primitives.
-//
+// Read / Write primitives. Volatile dereferences instead of memcpy so each
+// access is a single instruction under __try: a bad pointer then raises an
+// access violation caught by the SEH below (returns 0 / drops the write)
+// instead of bugchecking.
 template<size_t N>
-static uint64_t read_n( void* p ) { uint64_t v = 0; memcpy( &v, p, N ); return v; }
+static uint64_t read_n( void* p )
+{
+    uint64_t v = 0;
+    __try
+    {
+        if constexpr ( N == 1 ) v = *(volatile uint8_t*) p;
+        else if constexpr ( N == 2 ) v = *(volatile uint16_t*) p;
+        else if constexpr ( N == 4 ) v = *(volatile uint32_t*) p;
+        else if constexpr ( N == 8 ) v = *(volatile uint64_t*) p;
+    }
+    __except ( 1 ) { }
+    return v;
+}
 template<size_t N>
-static void write_n( void* p, uint64_t val ) { memcpy( p, &val, N ); }
+static void write_n( void* p, uint64_t val )
+{
+    __try
+    {
+        if constexpr ( N == 1 ) *(volatile uint8_t*) p = (uint8_t) val;
+        else if constexpr ( N == 2 ) *(volatile uint16_t*) p = (uint16_t) val;
+        else if constexpr ( N == 4 ) *(volatile uint32_t*) p = (uint32_t) val;
+        else if constexpr ( N == 8 ) *(volatile uint64_t*) p = val;
+    }
+    __except ( 1 ) { }
+}
 
 // CPU primitives.
 //
@@ -59,9 +83,10 @@ static uint32_t readtscp() { uint32_t aux; return __rdtscp( &aux ); }
 static uint64_t readpmc( uint32_t pmc ) { return __readpmc( pmc ); }
 static uint64_t readgsbase() { return _readgsbase_u64(); }
 static uint64_t readfsbase() { return _readfsbase_u64(); }
+static uint64_t readrsp() { return (uint64_t) _AddressOfReturnAddress(); }
 
 #pragma section(".stub", execute, read)
-#pragma comment(linker,"/SECTION:.stub,ERW")
+#pragma comment(linker,"/SECTION:.stub,ER")  // HVCI: RX only, no write (W^X)
 
 template<auto... Ops>
 struct as_code 
@@ -99,12 +124,10 @@ static uint64_t xgetbv( uint32_t reg ) { return _xgetbv( reg ); }
 static void monitor( void* adr ) { _mm_monitor( adr, 0, 0 ); }
 static void mwait() { _mm_mwait( 0, 0 ); }
 
-static uint64_t exec( const char* code, size_t length, uint64_t rcx, uint64_t rdx )
-{
-    __declspec( allocate( ".stub" ) ) static uint8_t space[ 0x1000 ];
-    memcpy( space, code, length > 0x1000 ? 0x1000 : length );
-    return ( ( uint64_t( __stdcall* )( uint64_t, uint64_t ) ) & space[ 0 ] )( rcx, rdx );
-}
+// NOTE: exec() (arbitrary shellcode runner) was removed for HVCI compliance.
+// It required W+X on one page (memcpy into space[] then call), which HVCI's
+// W^X enforcement forbids. Use native_function (the FFI) to call existing
+// kernel code by pointer instead.
 
 static void* read_svirt( const void* src, size_t n )
 {
@@ -241,12 +264,62 @@ static int fexport_all( lua_State* L )
     return 1;
 }
 
-// Returns the address of the object on the top of the stack, effectively leaking 
+// Returns the address of the object on the top of the stack, effectively leaking
 // memory information back to the virtual machine.
 //
 static int addressof( lua_State* L )
 {
     lua_pushinteger( L, ( uint64_t ) lua_adressof( L, 1 ) );
+    return 1;
+}
+
+// General-purpose byte-pattern scanner. Searches [base, base+size) for the
+// first occurrence of pattern with mask ('x' = match, '?' = wildcard).
+// Returns the address as an integer, or nil if not found.
+//
+static int find_pattern( lua_State* L )
+{
+    uint64_t base = lua_tounsigned( L, 1 );
+    size_t   size = (size_t) lua_tounsigned( L, 2 );
+    size_t   pat_len = 0;
+    const char* pattern = lua_tolstring( L, 3, &pat_len );
+    const char* mask = lua_tostring( L, 4 );
+
+    if ( !pattern || !mask || pat_len == 0 || size < pat_len )
+    {
+        lua_pushnil( L );
+        return 1;
+    }
+
+    const uint8_t* p = ( const uint8_t* ) base;
+    uint64_t result = 0;
+
+    __try
+    {
+        for ( size_t i = 0; i + pat_len <= size; i++ )
+        {
+            bool match = true;
+            for ( size_t j = 0; j < pat_len; j++ )
+            {
+                if ( mask[ j ] == 'x' && p[ i + j ] != ( uint8_t ) pattern[ j ] )
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if ( match )
+            {
+                result = base + i;
+                break;
+            }
+        }
+    }
+    __except ( 1 ) { }
+
+    if ( result )
+        lua_pushunsigned( L, result );
+    else
+        lua_pushnil( L );
     return 1;
 }
 
@@ -313,6 +386,7 @@ void lua::expose_api( lua_State* L )
     export_func( L, "readpmc", &readpmc );
     export_func( L, "readgsbase", &readgsbase );
     export_func( L, "readfsbase", &readfsbase );
+    export_func( L, "readrsp", &readrsp );
 
     export_func( L, "writecr2", writecr2 );
     export_func( L, "syscall", syscall );
@@ -341,7 +415,6 @@ void lua::expose_api( lua_State* L )
     export_func( L, "xgetbv", xgetbv );
     export_func( L, "monitor", monitor );
     export_func( L, "mwait", mwait );
-    export_func( L, "exec", exec );
 
     // Export simpler helpers.
     //
@@ -361,6 +434,8 @@ void lua::expose_api( lua_State* L )
     lua_setglobal( L, "addressof" );
     lua_pushcfunction( L, &fexport_all );
     lua_setglobal( L, "import" );
+    lua_pushcfunction( L, &find_pattern );
+    lua_setglobal( L, "find_pattern" );
 
     // Export Ntoskrnl.
     //

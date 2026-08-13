@@ -18,7 +18,8 @@
     <Configuration>Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">Win32</Platform>
     <RootNamespace>KernelLuaVm</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.19041.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WDKBuildFolder>10.0.26100.0</WDKBuildFolder>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
@@ -58,6 +59,7 @@
     <TimeStampServer>
     </TimeStampServer>
     <EnableInf2cat>false</EnableInf2cat>
+    <SignMode>Off</SignMode>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
@@ -84,6 +86,9 @@
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
     </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha1</FileDigestAlgorithm>
+    </DriverSign>
   </ItemDefinitionGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
@@ -144,6 +149,7 @@
     <ClCompile Include="lua\api.cpp" />
     <ClCompile Include="lua\native_function.cpp" />
     <ClCompile Include="lua\state.cpp" />
+    <ClCompile Include="callback.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -155,6 +161,7 @@
     <ClInclude Include="crt\stdint.h" />
     <ClInclude Include="driver_io.hpp" />
     <ClInclude Include="logger.hpp" />
+    <ClInclude Include="callback.hpp" />
     <ClInclude Include="lua\api.hpp" />
     <ClInclude Include="lua\native_function.hpp" />
     <ClInclude Include="lua\state.hpp" />

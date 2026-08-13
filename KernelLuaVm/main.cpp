@@ -6,32 +6,12 @@
 #include "lua/native_function.hpp"
 #include "driver_io.hpp"
 #include "lua/api.hpp"
+#include "callback.hpp"
 
 #pragma intrinsic(_enable)
 
 // Global Lua context and attaching helpers.
 //
-struct spinlock
-{
-    volatile long value = 0;
-    void lock()
-    {
-        KeEnterCriticalRegion();
-        while ( _interlockedbittestandset( &value, 0 ) )
-            _mm_pause();
-    }
-    void unlock()
-    {
-        _interlockedbittestandreset( &value, 0 );
-        KeLeaveCriticalRegion();
-    }
-};
-struct unique_lock 
-{ 
-    spinlock& lock;
-    unique_lock( spinlock& lock ) : lock( lock ) { lock.lock(); }
-    ~unique_lock() { lock.unlock(); }
-};
 lua_State* L = nullptr;
 spinlock LL = {};
 
@@ -210,6 +190,10 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
 //
 void unload_driver( PDRIVER_OBJECT driver )
 {
+    // Deactivate all callbacks (trampolines become no-ops).
+    //
+    callback::destroy();
+
     // Destroy the Lua context.
     //
     unique_lock _g{ LL };
@@ -286,5 +270,10 @@ extern "C" NTSTATUS DriverEntry( DRIVER_OBJECT* DriverObject, UNICODE_STRING* Re
     //
     L = lua::init();
     lua::expose_api( L );
+
+    // Initialize the universal callback bridge.
+    //
+    callback::init();
+    callback::expose_api( L );
     return STATUS_SUCCESS;
 }

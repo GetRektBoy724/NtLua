@@ -57,11 +57,10 @@ void worker_thread()
         Sleep( prev_success ? 100 : 5000 );
         static constexpr char worker_script[] = R"(
             if worker then 
-                worker() 
-                print("-")
+                worker()
             end
         )";
-        prev_success = execute( worker_script, true );
+        prev_success = execute( worker_script, false );
     }
 }
 
@@ -82,7 +81,9 @@ int main( int argc, const char** argv )
             std::string buffer{ std::istreambuf_iterator<char>( fs ), {} };
             execute( buffer.data(), false );
         }
-        return 0;
+        // Fall through to the REPL + worker thread so that scripts which
+        // registered callbacks (e.g. ProcessMonitor.lua) keep running and
+        // events are flushed via the worker.
     }
 
     // Start the worker thread.

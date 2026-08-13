@@ -2,7 +2,7 @@
 
 __declspec( restrict ) void* malloc( size_t n )
 {
-	return ExAllocatePool( NonPagedPool, n );
+	return ExAllocatePool( NonPagedPoolNx, n );
 }
 
 void free( void* p )

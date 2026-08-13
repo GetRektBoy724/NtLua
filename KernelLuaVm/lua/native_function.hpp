@@ -7,6 +7,9 @@ struct native_function
 {
     static constexpr const char* export_name = "native_function";
     const void* address = nullptr;
+    uint8_t ret_width = 8;   // trusted result bytes: x64 only defines AL/AX
+                             // for 8/16-bit return values, so sub-width
+                             // results must be masked before use.
 
     // Allocator.
     //
@@ -23,6 +26,7 @@ struct native_function
     // Member functions.
     //
     static int get_address( lua_State* L );
+    static int get_set_ret_width( lua_State* L );
     static int invoke( lua_State* L );
     static int to_string( lua_State* L );
 
@@ -33,6 +37,7 @@ struct native_function
         static const luaL_Reg method_table[] = {
             { "new", create },
             { "address", get_address },
+            { "ret_width", get_set_ret_width },
             { nullptr, nullptr }
         };
 

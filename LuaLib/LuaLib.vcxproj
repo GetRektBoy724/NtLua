@@ -76,7 +76,8 @@
     <ProjectGuid>{71FC9FC1-F46F-41D4-913E-07298D6E8220}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
     <RootNamespace>LuaLib</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0.19041.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WDKBuildFolder>10.0.26100.0</WDKBuildFolder>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
@@ -149,7 +150,7 @@
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <TreatWarningAsError>false</TreatWarningAsError>
-      <AdditionalOptions>/Gs10000000 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/kernel /Gs10000000 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
