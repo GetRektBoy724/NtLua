@@ -79,7 +79,7 @@ namespace callback
 
         // Reentrancy: if the current thread already holds LL (either from
         // the REPL path or a higher callback), bypass to avoid deadlock.
-        // Non-reentrant spinlock - can't re-acquire on the same thread.
+        // The VM lock is non-reentrant - can't re-acquire on the same thread.
         //
         if ( LL.owned_by_current() )
             return 0;

@@ -12,6 +12,54 @@ static void export_func( lua_State* L, const char* name, const void* ptr )
     lua_setglobal( L, name );
 }
 
+// Bind a plain C function to a Lua closure, bypassing the native_function
+// FFI. The hot read/write/CPU primitives fire once per syscall in the
+// nonblocking hook, and the FFI's __call metatable lookup + per-arg type
+// switch is the bulk of their cost; a light C function drops all of it.
+//
+static void export_cfunc( lua_State* L, const char* name, lua_CFunction fn )
+{
+    lua_pushcfunction( L, fn );
+    lua_setglobal( L, name );
+}
+
+// Adapters converting a fixed-signature function into a lua_CFunction.
+// Each reads its integer args with lua_tounsigned (the numeric branch of the
+// old lua_asintrinsic) and pushes the result as an unsigned 64-bit integer.
+//
+template<uint64_t ( *Fn )()>
+static int l_read0( lua_State* L ) { lua_pushunsigned( L, Fn() ); return 1; }
+template<uint32_t ( *Fn )()>
+static int l_read0_32( lua_State* L ) { lua_pushunsigned( L, Fn() ); return 1; }
+template<uint64_t ( *Fn )( void* )>
+static int l_readaddr( lua_State* L ) { lua_pushunsigned( L, Fn( ( void* ) lua_tounsigned( L, 1 ) ) ); return 1; }
+template<void ( *Fn )( void*, uint64_t )>
+static int l_writeaddr( lua_State* L ) { Fn( ( void* ) lua_tounsigned( L, 1 ), lua_tounsigned( L, 2 ) ); return 0; }
+template<uint64_t ( *Fn )( uint32_t )>
+static int l_read_u32( lua_State* L ) { lua_pushunsigned( L, Fn( ( uint32_t ) lua_tounsigned( L, 1 ) ) ); return 1; }
+template<void ( *Fn )( uint32_t, uint64_t )>
+static int l_write_u32( lua_State* L ) { Fn( ( uint32_t ) lua_tounsigned( L, 1 ), lua_tounsigned( L, 2 ) ); return 0; }
+template<void ( *Fn )( uint64_t )>
+static int l_write_u64( lua_State* L ) { Fn( lua_tounsigned( L, 1 ) ); return 0; }
+template<uint64_t ( *Fn )( uint64_t )>
+static int l_read_u64( lua_State* L ) { lua_pushunsigned( L, Fn( lua_tounsigned( L, 1 ) ) ); return 1; }
+
+static int l_memcpy( lua_State* L )
+{
+    lua_pushunsigned( L, ( uint64_t ) memcpy( ( void* ) lua_tounsigned( L, 1 ), ( void* ) lua_tounsigned( L, 2 ), ( size_t ) lua_tounsigned( L, 3 ) ) );
+    return 1;
+}
+static int l_memset( lua_State* L )
+{
+    lua_pushunsigned( L, ( uint64_t ) memset( ( void* ) lua_tounsigned( L, 1 ), ( int ) lua_tounsigned( L, 2 ), ( size_t ) lua_tounsigned( L, 3 ) ) );
+    return 1;
+}
+static int l_memcmp( lua_State* L )
+{
+    lua_pushunsigned( L, ( uint64_t )( int64_t ) memcmp( ( void* ) lua_tounsigned( L, 1 ), ( void* ) lua_tounsigned( L, 2 ), ( size_t ) lua_tounsigned( L, 3 ) ) );
+    return 1;
+}
+
 // Read / Write primitives. Volatile dereferences instead of memcpy so each
 // access is a single instruction under __try: a bad pointer then raises an
 // access violation caught by the SEH below (returns 0 / drops the write)
@@ -333,44 +381,44 @@ void lua::expose_api( lua_State* L )
 
     // Export memory primitives.
     //
-    export_func( L, "memcpy", &memcpy );
-    export_func( L, "memset", &memset );
-    export_func( L, "memcmp", &memcmp );
-    export_func( L, "read1", &read_n<1> );
-    export_func( L, "read2", &read_n<2> );
-    export_func( L, "read4", &read_n<4> );
-    export_func( L, "read8", &read_n<8> );
-    export_func( L, "write1", &write_n<1> );
-    export_func( L, "write2", &write_n<2> );
-    export_func( L, "write4", &write_n<4> );
-    export_func( L, "write8", &write_n<8> );
+    export_cfunc( L, "memcpy", &l_memcpy );
+    export_cfunc( L, "memset", &l_memset );
+    export_cfunc( L, "memcmp", &l_memcmp );
+    export_cfunc( L, "read1", &l_readaddr<&read_n<1>> );
+    export_cfunc( L, "read2", &l_readaddr<&read_n<2>> );
+    export_cfunc( L, "read4", &l_readaddr<&read_n<4>> );
+    export_cfunc( L, "read8", &l_readaddr<&read_n<8>> );
+    export_cfunc( L, "write1", &l_writeaddr<&write_n<1>> );
+    export_cfunc( L, "write2", &l_writeaddr<&write_n<2>> );
+    export_cfunc( L, "write4", &l_writeaddr<&write_n<4>> );
+    export_cfunc( L, "write8", &l_writeaddr<&write_n<8>> );
 
     // Export CPU primitives.
     //
-    export_func( L, "readmsr", &readmsr );
-    export_func( L, "writemsr", &writemsr );
-    export_func( L, "readcr0", &readcr0 );
-    export_func( L, "readcr2", &readcr2 );
-    export_func( L, "readcr3", &readcr3 );
-    export_func( L, "readcr4", &readcr4 );
-    export_func( L, "readcr8", &readcr8 );
-    export_func( L, "writecr0", &writecr0 );
-    export_func( L, "writecr3", &writecr3 );
-    export_func( L, "writecr4", &writecr4 );
-    export_func( L, "writecr8", &writecr8 );
+    export_cfunc( L, "readmsr", &l_read_u32<&readmsr> );
+    export_cfunc( L, "writemsr", &l_write_u32<&writemsr> );
+    export_cfunc( L, "readcr0", &l_read0<&readcr0> );
+    export_cfunc( L, "readcr2", &l_read0<&readcr2> );
+    export_cfunc( L, "readcr3", &l_read0<&readcr3> );
+    export_cfunc( L, "readcr4", &l_read0<&readcr4> );
+    export_cfunc( L, "readcr8", &l_read0<&readcr8> );
+    export_cfunc( L, "writecr0", &l_write_u64<&writecr0> );
+    export_cfunc( L, "writecr3", &l_write_u64<&writecr3> );
+    export_cfunc( L, "writecr4", &l_write_u64<&writecr4> );
+    export_cfunc( L, "writecr8", &l_write_u64<&writecr8> );
 
-    export_func( L, "readdr0", &readdr0 );
-    export_func( L, "readdr1", &readdr1 );
-    export_func( L, "readdr2", &readdr2 );
-    export_func( L, "readdr3", &readdr3 );
-    export_func( L, "readdr6", &readdr6 );
-    export_func( L, "readdr7", &readdr7 );
-    export_func( L, "writedr0", &writedr0 );
-    export_func( L, "writedr1", &writedr1 );
-    export_func( L, "writedr2", &writedr2 );
-    export_func( L, "writedr3", &writedr3 );
-    export_func( L, "writedr6", &writedr6 );
-    export_func( L, "writedr7", &writedr7 );
+    export_cfunc( L, "readdr0", &l_read0<&readdr0> );
+    export_cfunc( L, "readdr1", &l_read0<&readdr1> );
+    export_cfunc( L, "readdr2", &l_read0<&readdr2> );
+    export_cfunc( L, "readdr3", &l_read0<&readdr3> );
+    export_cfunc( L, "readdr6", &l_read0<&readdr6> );
+    export_cfunc( L, "readdr7", &l_read0<&readdr7> );
+    export_cfunc( L, "writedr0", &l_write_u64<&writedr0> );
+    export_cfunc( L, "writedr1", &l_write_u64<&writedr1> );
+    export_cfunc( L, "writedr2", &l_write_u64<&writedr2> );
+    export_cfunc( L, "writedr3", &l_write_u64<&writedr3> );
+    export_cfunc( L, "writedr6", &l_write_u64<&writedr6> );
+    export_cfunc( L, "writedr7", &l_write_u64<&writedr7> );
 
     export_func( L, "inbyte", &inbyte );
     export_func( L, "inword", &inword );
@@ -380,13 +428,13 @@ void lua::expose_api( lua_State* L )
     export_func( L, "outword", &outword );
     export_func( L, "outdword", &outdword );
 
-    export_func( L, "readtsc", &readtsc );
-    export_func( L, "readtscpa", &readtscpa );
-    export_func( L, "readtscp", &readtscp );
-    export_func( L, "readpmc", &readpmc );
-    export_func( L, "readgsbase", &readgsbase );
-    export_func( L, "readfsbase", &readfsbase );
-    export_func( L, "readrsp", &readrsp );
+    export_cfunc( L, "readtsc", &l_read0<&readtsc> );
+    export_cfunc( L, "readtscpa", &l_read0_32<&readtscpa> );
+    export_cfunc( L, "readtscp", &l_read0_32<&readtscp> );
+    export_cfunc( L, "readpmc", &l_read_u32<&readpmc> );
+    export_cfunc( L, "readgsbase", &l_read0<&readgsbase> );
+    export_cfunc( L, "readfsbase", &l_read0<&readfsbase> );
+    export_cfunc( L, "readrsp", &l_read0<&readrsp> );
 
     export_func( L, "writecr2", writecr2 );
     export_func( L, "syscall", syscall );
@@ -423,10 +471,10 @@ void lua::expose_api( lua_State* L )
     export_func( L, "attach_process", &attach_process );
     export_func( L, "attach_pid", &attach_pid );
     export_func( L, "detach", &detach );
-    export_func( L, "readp1", &read_pn<1> );
-    export_func( L, "readp2", &read_pn<2> );
-    export_func( L, "readp4", &read_pn<4> );
-    export_func( L, "readp8", &read_pn<8> );
+    export_cfunc( L, "readp1", &l_read_u64<&read_pn<1>> );
+    export_cfunc( L, "readp2", &l_read_u64<&read_pn<2>> );
+    export_cfunc( L, "readp4", &l_read_u64<&read_pn<4>> );
+    export_cfunc( L, "readp8", &l_read_u64<&read_pn<8>> );
 
     // Export misc. functions.
     //

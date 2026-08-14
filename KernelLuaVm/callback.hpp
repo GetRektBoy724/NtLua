@@ -4,37 +4,44 @@
 #include <intrin.h>
 #include "lua/state.hpp"
 
-// Spinlock with owner tracking (for callback reentrancy detection).
+// VM lock with owner tracking (for callback reentrancy detection).
 // Moved here from main.cpp so both main.cpp and callback.cpp can use it.
+// Backed by a KMUTEX so the blocking path waits at PASSIVE_LEVEL instead of
+// spinning. FAST_MUTEX is deliberately NOT used: it raises IRQL to
+// APC_LEVEL, but the VM runs arbitrary kernel code (via the FFI) that must
+// execute at PASSIVE_LEVEL. A zero-timeout wait gives the nonblocking path.
 //
-struct spinlock
+struct vm_lock
 {
-    volatile long value = 0;
+    KMUTEX mutex = {};
     volatile void* owner = nullptr;
 
+    void init()
+    {
+        KeInitializeMutex( &mutex, 0 );
+    }
     void lock()
     {
-        KeEnterCriticalRegion();
-        while ( _interlockedbittestandset( &value, 0 ) )
-            _mm_pause();
+        KeWaitForSingleObject( &mutex, Executive, KernelMode, FALSE, nullptr );
         owner = (void*) KeGetCurrentThread();
     }
     bool try_lock()
     {
-        KeEnterCriticalRegion();
-        if ( _interlockedbittestandset( &value, 0 ) )
-        {
-            KeLeaveCriticalRegion();
+        LARGE_INTEGER timeout = {};
+        NTSTATUS status = KeWaitForSingleObject( &mutex, Executive, KernelMode, FALSE, &timeout );
+        // STATUS_TIMEOUT is a success-severity code, so NT_SUCCESS would be
+        // wrong here: a busy mutex expires the zero-length wait and returns
+        // STATUS_TIMEOUT WITHOUT acquiring ownership. Releasing a mutex we
+        // never owned raises STATUS_MUTANT_NOT_OWNED (bugcheck 0x3B).
+        if ( status == STATUS_TIMEOUT )
             return false;
-        }
         owner = (void*) KeGetCurrentThread();
         return true;
     }
     void unlock()
     {
         owner = nullptr;
-        _interlockedbittestandreset( &value, 0 );
-        KeLeaveCriticalRegion();
+        KeReleaseMutex( &mutex, FALSE );
     }
     bool owned_by_current() const
     {
@@ -43,9 +50,9 @@ struct spinlock
 };
 struct unique_lock
 {
-    spinlock& lock;
+    vm_lock& lock;
     bool acquired;
-    unique_lock( spinlock& lock, bool blocking = true ) : lock( lock )
+    unique_lock( vm_lock& lock, bool blocking = true ) : lock( lock )
     {
         if ( blocking )
         {
@@ -65,7 +72,7 @@ struct unique_lock
 // Globals - defined in main.cpp, used by callback.cpp.
 //
 extern lua_State* L;
-extern spinlock LL;
+extern vm_lock LL;
 
 // Universal callback bridge.
 //

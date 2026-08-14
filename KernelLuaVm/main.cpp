@@ -13,7 +13,7 @@
 // Global Lua context and attaching helpers.
 //
 lua_State* L = nullptr;
-spinlock LL = {};
+vm_lock LL = {};
 
 PEPROCESS attached_process = nullptr;
 KAPC_STATE apc_state;
@@ -93,7 +93,6 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
     }
     else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RUN )
     {
-        unique_lock _g{ LL };
         const char* input = ( const char* ) irp->AssociatedIrp.SystemBuffer;
         ntlua_result* result = ( ntlua_result* ) irp->AssociatedIrp.SystemBuffer;
 
@@ -108,43 +107,68 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
         //
         if ( input && input_length && input[ input_length - 1 ] == 0x0 )
         {
-            // Reset logger buffers.
-            //
-            logger::errors.reset();
-            logger::logs.reset();
-
-            // Execute the code in the buffer.
-            //
-            lua::begin_ctx();
-            lua::execute( L, input, true );
-            lua::end_ctx();
-
-            // Zero out the result.
-            //
-            result->errors = nullptr;
-            result->outputs = nullptr;
-
-            // Declare a helper exporting the buffer from KM memory to UM memory.
-            //
-            const auto export_buffer = [ ] ( logger::string_buffer& buf ) -> char*
+            struct captured_buffer
             {
-                if ( !buf.iterator )
+                char*  data   = nullptr;
+                size_t length = 0;
+            };
+
+            captured_buffer errors_copy, outputs_copy;
+
+            // Snapshot the output under the VM lock, but keep the lock scope
+            // as small as possible: exporting into user mode (below) does a
+            // ZwAllocateVirtualMemory plus a copy, which must NOT hold LL -
+            // otherwise every syscall callback that fires during that copy
+            // misses the nonblocking gate.
+            //
+            {
+                unique_lock _g{ LL };
+
+                logger::errors.reset();
+                logger::logs.reset();
+
+                lua::begin_ctx();
+                lua::execute( L, input, true );
+                lua::end_ctx();
+
+                const auto capture = [ ] ( logger::string_buffer& buf ) -> captured_buffer
+                {
+                    captured_buffer out;
+                    if ( buf.iterator )
+                    {
+                        out.data = ( char* ) malloc( buf.iterator + 1 );
+                        if ( out.data )
+                        {
+                            memcpy( out.data, buf.raw, buf.iterator );
+                            out.data[ buf.iterator ] = 0;
+                            out.length = buf.iterator;
+                        }
+                    }
+                    buf.reset();
+                    return out;
+                };
+
+                errors_copy  = capture( logger::errors );
+                outputs_copy = capture( logger::logs );
+            }
+
+            // Export the captured output into user-mode memory, outside LL.
+            //
+            const auto export_to_um = [ ] ( captured_buffer& buf ) -> char*
+            {
+                if ( !buf.data )
                     return nullptr;
 
-                // Allocate user-mode memory to hold this buffer.
-                //
                 char* region = nullptr;
-                size_t size = buf.iterator + 1;
+                size_t size = buf.length + 1;
                 ZwAllocateVirtualMemory( NtCurrentProcess(), ( void** ) &region, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
-                
-                // Copy the buffer if allocation was succesful.
-                //
+
                 if ( region )
                 {
                     __try
                     {
-                        memcpy( region, buf.raw, buf.iterator );
-                        region[ buf.iterator ] = 0;
+                        memcpy( region, buf.data, buf.length );
+                        region[ buf.length ] = 0;
                     }
                     __except ( 1 )
                     {
@@ -152,22 +176,18 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
                     }
                 }
 
-                // Reset the buffer and return the newly allocated region.
-                //
-                buf.reset();
                 return region;
             };
 
-            // If we have a valid output buffer:
-            //
             if ( output_length >= sizeof( ntlua_result ) )
             {
-                if ( logger::errors.iterator )
-                    result->errors = export_buffer( logger::errors );
-                if ( logger::logs.iterator )
-                    result->outputs = export_buffer( logger::logs );
+                result->errors  = export_to_um( errors_copy );
+                result->outputs = export_to_um( outputs_copy );
                 irp->IoStatus.Information = sizeof( ntlua_result );
             }
+
+            if ( errors_copy.data )  free( errors_copy.data );
+            if ( outputs_copy.data ) free( outputs_copy.data );
         }
     }
     else
@@ -228,6 +248,10 @@ extern "C" NTSTATUS DriverEntry( DRIVER_OBJECT* DriverObject, UNICODE_STRING* Re
     // Run static initializers.
     //
     crt::initialize();
+
+    // Initialize the VM lock before any IOCTL or callback can touch it.
+    //
+    LL.init();
 
     // Create a device object.
     //
