@@ -484,8 +484,11 @@ if use_qpc then
     write8(get_cpu_clock, 2)
     print("[hook] GetCpuClock = 2")
 
-    -- Overwrite *HvlGetQpcBias with our trampoline
+    -- Overwrite *HvlGetQpcBias with our trampoline. If the VM can't run
+    -- (lock busy / elevated IRQL), forward to the original routine so the
+    -- clock returns a real timestamp instead of 0.
     orig_bias = read8(hvl_bias)
+    SetFallback(gc_eid, orig_bias, 8)
     write8(hvl_bias, gc_tramp)
     print("[hook] HvlGetQpcBias overwritten")
 
@@ -504,6 +507,7 @@ if use_qpc then
     end
 else
     -- Win7 to Win10 1909: directly overwrite GetCpuClock
+    SetFallback(gc_eid, orig_gcc, 8)
     write8(get_cpu_clock, gc_tramp)
     print("[hook] GetCpuClock overwritten")
 end

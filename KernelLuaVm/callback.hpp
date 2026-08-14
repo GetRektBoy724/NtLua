@@ -90,7 +90,8 @@ namespace callback
     void destroy();
 
     // Expose callback Lua API to a Lua state.
-    // Adds: AllocateEvent, SetHandler, GetTrampoline, FreeEvent.
+    // Adds: AllocateEvent, SetHandler, GetTrampoline, FreeEvent,
+    //       SetFallback, SetFallbackValue, ClearFallback.
     //
     void expose_api( lua_State* L );
 

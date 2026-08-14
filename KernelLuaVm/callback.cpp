@@ -1,14 +1,19 @@
 #include "callback.hpp"
 #include "logger.hpp"
+#include "lua/native_function.hpp"
 
 // - Registry -
 //
 struct callback_registration
 {
     int       lua_ref   = LUA_NOREF;   // luaL_ref, or LUA_NOREF if free
-    uint8_t   arg_count = 0;           // number of args to push to Lua
+    uint8_t   arg_count = 0;           // args pushed to Lua / forwarded to fallback
+    uint8_t   fallback_ret_width = 8;  // trusted result bytes for the fallback call
     bool      active    = false;       // slot in use
-    bool      nonblocking = false;     // try LL instead of spinning; return 0 if busy
+    bool      nonblocking = false;     // try LL instead of bailing to the fallback
+
+    const void* fallback_address = nullptr; // native fn called when the VM can't run
+    uint64_t    fallback_value   = 0;       // returned when no fallback_address is set
 };
 
 static callback_registration cb_registry[ callback::MAX_EVENTS ];
@@ -59,6 +64,48 @@ static __declspec(noinline) uint64_t capture_tramp(
 #include "trampolines.inc"
 #undef TRAMP
 
+// - Fallback invocation -
+// When the VM cannot run (elevated IRQL, reentrancy, or lock contention) the
+// bridge routes to a user-supplied native fallback instead of returning a
+// hardcoded 0. The fallback is called with exactly arg_count captured
+// arguments (the same ones the kernel passed to the original routine); if no
+// fallback address is set, a constant fallback_value is returned instead.
+//
+static uint64_t invoke_fallback(
+    const void* address,
+    uint8_t ret_width,
+    int arg_count,
+    uint64_t fallback_value,
+    const uint64_t* args )
+{
+    if ( !address )
+        return fallback_value;
+
+    auto call = [ & ] <typename... T>(
+        auto&& self, size_t index, T... values ) -> uint64_t
+    {
+        if constexpr ( sizeof...( T ) <= 16 )
+        {
+            if ( index == ( size_t ) arg_count )
+                return ( ( uint64_t( __stdcall* )( T... ) ) address )( values... );
+            return self( self, index + 1, values..., args[ index ] );
+        }
+        __assume( 0 );
+    };
+
+    uint64_t result = call( call, 0 );
+
+    switch ( ret_width )
+    {
+        case 1:  result &= 0xFF; break;
+        case 2:  result &= 0xFFFF; break;
+        case 4:  result &= 0xFFFFFFFF; break;
+        default: break;
+    }
+
+    return result;
+}
+
 // - Dispatch -
 //
 namespace callback
@@ -70,19 +117,30 @@ namespace callback
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return 0;
 
+        // Snapshot the fallback fields up front so the early-return paths can
+        // route to them without taking cb_registry_lock. Aligned 8-byte reads
+        // are atomic on x64; a concurrent SetFallback may briefly pair a new
+        // address with the previous width (benign - width is almost always 8).
+        //
+        const callback_registration& reg = cb_registry[ event_id ];
+        const void* fb_addr  = reg.fallback_address;
+        uint8_t     fb_width = reg.fallback_ret_width;
+        uint64_t    fb_value = reg.fallback_value;
+        int         fb_argc  = reg.arg_count;
+
         // Above PASSIVE_LEVEL (ETW timestamps fire at DISPATCH in DPC/interrupt
         // context) we must never wait on the VM lock: spinning there starves
         // the passive-level holder of its CPU (the original machine freeze).
         //
         if ( KeGetCurrentIrql() > PASSIVE_LEVEL )
-            return 0;
+            return invoke_fallback( fb_addr, fb_width, fb_argc, fb_value, args );
 
         // Reentrancy: if the current thread already holds LL (either from
         // the REPL path or a higher callback), bypass to avoid deadlock.
         // The VM lock is non-reentrant - can't re-acquire on the same thread.
         //
         if ( LL.owned_by_current() )
-            return 0;
+            return invoke_fallback( fb_addr, fb_width, fb_argc, fb_value, args );
 
         // Acquire LL - protects L (shared with the REPL/IOCTL path).
         // Non-blocking events try once and bail instead of spinning: they
@@ -91,7 +149,7 @@ namespace callback
         //
         unique_lock _g{ LL, !cb_registry[ event_id ].nonblocking };
         if ( !_g.acquired )
-            return 0;
+            return invoke_fallback( fb_addr, fb_width, fb_argc, fb_value, args );
 
         // Re-check active inside the lock - ensures we don't access L
         // after unload_driver has destroyed it (unload holds LL while
@@ -157,10 +215,13 @@ namespace callback
 
         for ( int i = 0; i < MAX_EVENTS; i++ )
         {
-            cb_registry[ i ].lua_ref   = LUA_NOREF;
-            cb_registry[ i ].arg_count = 0;
-            cb_registry[ i ].active    = false;
-            cb_trampoline_table[ i ]   = nullptr;
+            cb_registry[ i ].lua_ref            = LUA_NOREF;
+            cb_registry[ i ].arg_count          = 0;
+            cb_registry[ i ].active             = false;
+            cb_registry[ i ].fallback_address   = nullptr;
+            cb_registry[ i ].fallback_ret_width = 8;
+            cb_registry[ i ].fallback_value     = 0;
+            cb_trampoline_table[ i ]            = nullptr;
         }
 
         // Populate trampoline table with the 256 pre-compiled addresses.
@@ -174,12 +235,19 @@ namespace callback
     {
         // Mark all slots inactive. Trampolines become no-ops (dispatch checks
         // active inside LL, which unload_driver holds before lua::destroy).
-        // lua_close(L) will free all registry refs automatically.
+        // lua_close(L) will free all registry refs automatically. Fallbacks
+        // are cleared too so a straggler trampoline can't invoke a stale
+        // native pointer during unload.
         //
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
         for ( int i = 0; i < MAX_EVENTS; i++ )
-            cb_registry[ i ].active = false;
+        {
+            cb_registry[ i ].active             = false;
+            cb_registry[ i ].fallback_address   = nullptr;
+            cb_registry[ i ].fallback_ret_width = 8;
+            cb_registry[ i ].fallback_value     = 0;
+        }
         KeReleaseSpinLock( &cb_registry_lock, old );
     }
 
@@ -192,10 +260,13 @@ namespace callback
 
     // - Lua API -
     //
-    //  AllocateEvent()     -> event_id (integer 0-255) or nil
+    //  AllocateEvent()                    -> event_id (integer 0-255) or nil
     //  SetHandler(eid, argc, fn [, nonblocking])
-    //  GetTrampoline(eid)  -> address (integer) or nil
+    //  GetTrampoline(eid)                 -> address (integer) or nil
     //  FreeEvent(eid)
+    //  SetFallback(eid, addr_or_fn [, ret_width])
+    //  SetFallbackValue(eid, value)
+    //  ClearFallback(eid)
     //
 
     static int allocate_event( lua_State* Ls )
@@ -276,12 +347,88 @@ namespace callback
         int ref = cb_registry[ event_id ].lua_ref;
         cb_registry[ event_id ].lua_ref = LUA_NOREF;
         cb_registry[ event_id ].active  = false;
+        cb_registry[ event_id ].fallback_address = nullptr;
+        cb_registry[ event_id ].fallback_ret_width = 8;
+        cb_registry[ event_id ].fallback_value = 0;
         KeReleaseSpinLock( &cb_registry_lock, old );
 
         // Unref at PASSIVE (outside spinlock).
         //
         if ( ref != LUA_NOREF )
             luaL_unref( Ls, LUA_REGISTRYINDEX, ref );
+
+        return 0;
+    }
+
+    // SetFallback(eid, addr_or_function [, ret_width])
+    //   addr_or_function: raw integer address OR a native_function userdata
+    //   (in which case its address and ret_width are copied over).
+    //
+    static int set_fallback( lua_State* Ls )
+    {
+        int event_id = (int) luaL_checkunsigned( Ls, 1 );
+        if ( event_id < 0 || event_id >= MAX_EVENTS )
+            return luaL_error( Ls, "invalid event_id %d", event_id );
+
+        const void* address = nullptr;
+        uint8_t width = 8;
+
+        native_function* fn = ( native_function* ) luaL_testudata( Ls, 2, native_function::export_name );
+        if ( fn )
+        {
+            address = fn->address;
+            width   = fn->ret_width;
+        }
+        else
+        {
+            address = ( const void* ) lua_tounsigned( Ls, 2 );
+        }
+
+        if ( !lua_isnoneornil( Ls, 3 ) )
+        {
+            int w = (int) luaL_checkunsigned( Ls, 3 );
+            if ( w != 1 && w != 2 && w != 4 && w != 8 )
+                return luaL_error( Ls, "ret_width must be 1, 2, 4 or 8, got %d", w );
+            width = (uint8_t) w;
+        }
+
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+        cb_registry[ event_id ].fallback_address = address;
+        cb_registry[ event_id ].fallback_ret_width = width;
+        KeReleaseSpinLock( &cb_registry_lock, old );
+
+        return 0;
+    }
+
+    static int set_fallback_value( lua_State* Ls )
+    {
+        int event_id = (int) luaL_checkunsigned( Ls, 1 );
+        if ( event_id < 0 || event_id >= MAX_EVENTS )
+            return luaL_error( Ls, "invalid event_id %d", event_id );
+
+        uint64_t value = lua_tounsigned( Ls, 2 );
+
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+        cb_registry[ event_id ].fallback_value = value;
+        KeReleaseSpinLock( &cb_registry_lock, old );
+
+        return 0;
+    }
+
+    static int clear_fallback( lua_State* Ls )
+    {
+        int event_id = (int) luaL_checkunsigned( Ls, 1 );
+        if ( event_id < 0 || event_id >= MAX_EVENTS )
+            return luaL_error( Ls, "invalid event_id %d", event_id );
+
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+        cb_registry[ event_id ].fallback_address = nullptr;
+        cb_registry[ event_id ].fallback_ret_width = 8;
+        cb_registry[ event_id ].fallback_value = 0;
+        KeReleaseSpinLock( &cb_registry_lock, old );
 
         return 0;
     }
@@ -299,5 +446,14 @@ namespace callback
 
         lua_pushcfunction( Ls, &free_event );
         lua_setglobal( Ls, "FreeEvent" );
+
+        lua_pushcfunction( Ls, &set_fallback );
+        lua_setglobal( Ls, "SetFallback" );
+
+        lua_pushcfunction( Ls, &set_fallback_value );
+        lua_setglobal( Ls, "SetFallbackValue" );
+
+        lua_pushcfunction( Ls, &clear_fallback );
+        lua_setglobal( Ls, "ClearFallback" );
     }
 }
