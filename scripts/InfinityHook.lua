@@ -30,12 +30,64 @@ local CKCL_GUID_W2  = 0xed1f
 local CKCL_GUID_W3  = 0x42a4
 local CKCL_GUID_LOW = 0x74f156d0633e71af   -- bytes: af 71 3e 63 d0 56 f1 74
 
+-- === Struct definitions ===
+
+local GUID = struct.define {
+    Data1 = { 0x00, 4 },
+    Data2 = { 0x04, 2 },
+    Data3 = { 0x06, 2 },
+    Data4 = { 0x08, 8 },
+}
+
+local UNICODE_STRING = struct.define {
+    Length        = { 0x00, 2 },
+    MaximumLength = { 0x02, 2 },
+    Buffer        = { 0x08, 8 },
+}
+
+local OBJECT_ATTRIBUTES = struct.define {
+    ObjectName = { 0x10, 8 },
+}
+
+-- EVENT_TRACE_PROPERTIES: WNODE_HEADER followed by trace-specific fields.
+-- Only the fields this script touches are declared.
+local EVENT_TRACE_PROPERTIES = struct.define {
+    WnodeBufferSize = { 0x00, 4 },
+    Guid            = { 0x18, 16, type = GUID },
+    ClientContext   = { 0x28, 4 },
+    Flags           = { 0x2C, 4 },
+    BufferSize      = { 0x30, 4 },
+    MinimumBuffers  = { 0x34, 4 },
+    MaximumBuffers  = { 0x38, 4 },
+    LogFileMode     = { 0x40, 4 },
+    EnableFlags     = { 0x48, 4 },
+    ProviderName    = { 0x90, 16, type = UNICODE_STRING },
+}
+
+-- PE image headers (only the fields used for scanning).
+local IMAGE_DOS_HEADER = struct.define {
+    e_lfanew = { 0x3C, 4 },
+}
+local IMAGE_FILE_HEADER = struct.define {
+    NumberOfSections     = { 0x02, 2 },
+    SizeOfOptionalHeader = { 0x10, 2 },
+}
+local IMAGE_OPTIONAL_HEADER = struct.define {
+    SizeOfImage = { 0x38, 4 },
+}
+local IMAGE_SECTION_HEADER = struct.define {
+    VirtualSize     = { 0x08, 4 },
+    VirtualAddress  = { 0x0C, 4 },
+    Characteristics = { 0x24, 4 },
+}
+
 -- True if a2 points at an EVENT_TRACE_PROPERTIES/WNODE carrying the CKCL GUID.
 local function is_ckcl_props(a2)
-    return read4(a2 + 0x18) == CKCL_GUID_D1 and
-           read2(a2 + 0x1C) == CKCL_GUID_W2 and
-           read2(a2 + 0x1E) == CKCL_GUID_W3 and
-           read8(a2 + 0x20) == CKCL_GUID_LOW
+    local g = EVENT_TRACE_PROPERTIES(a2).Guid
+    return g.Data1 == CKCL_GUID_D1 and
+           g.Data2 == CKCL_GUID_W2 and
+           g.Data3 == CKCL_GUID_W3 and
+           g.Data4 == CKCL_GUID_LOW
 end
 
 -- === Helpers ===
@@ -142,8 +194,8 @@ end
 
 -- ntoskrnl base + image size
 local nt_base = nt.base_address:address()
-local pe_off  = read4(nt_base + 0x3C)
-local nt_size = read4(nt_base + pe_off + 24 + 0x38)
+local pe_off  = IMAGE_DOS_HEADER(nt_base).e_lfanew
+local nt_size = IMAGE_OPTIONAL_HEADER(nt_base + pe_off + 24).SizeOfImage
 local build   = get_build_number()
 
 print("[init] ntoskrnl=" .. hex(nt_base) .. " size=" .. nt_size .. " build=" .. build)
@@ -151,16 +203,14 @@ print("[init] ntoskrnl=" .. hex(nt_base) .. " size=" .. nt_size .. " build=" .. 
 -- Section-scoped pattern scanner. Scans all non-discardable sections
 -- (discarded sections like INIT have freed pages -> bugcheck 0x50).
 local function find_pattern_safe(pattern, mask)
-    local num_sections = read2(nt_base + pe_off + 6)
-    local opt_size = read2(nt_base + pe_off + 20)
+    local fh = IMAGE_FILE_HEADER(nt_base + pe_off + 4)
+    local num_sections = fh.NumberOfSections
+    local opt_size = fh.SizeOfOptionalHeader
     local sec_table = nt_base + pe_off + 24 + opt_size
     for i = 0, num_sections - 1 do
-        local s = sec_table + i * 40
-        local flags = read4(s + 36)
-        if (flags & 0x02000000) == 0 then  -- skip IMAGE_SCN_MEM_DISCARDABLE
-            local vsize = read4(s + 8)
-            local vaddr = read4(s + 12)
-            local result = find_pattern(nt_base + vaddr, vsize, pattern, mask)
+        local s = IMAGE_SECTION_HEADER(sec_table + i * 40)
+        if (s.Characteristics & 0x02000000) == 0 then  -- skip IMAGE_SCN_MEM_DISCARDABLE
+            local result = find_pattern(nt_base + s.VirtualAddress, s.VirtualSize, pattern, mask)
             if result then return result end
         end
     end
@@ -188,20 +238,20 @@ end
 local function fill_ckcl_struct(b, enable_flags)
     memset(b, 0, 0x1000)
 
-    write4(b + 0x00, 0x1000)
-    write4(b + 0x18, CKCL_GUID_D1)
-    write2(b + 0x1C, CKCL_GUID_W2)
-    write2(b + 0x1E, CKCL_GUID_W3)
-    write8(b + 0x20, CKCL_GUID_LOW)
-    write4(b + 0x28, 3)
-    write4(b + 0x2C, WNODE_FLAG_TRACED_GUID)
-
-    write4(b + 0x30, 64)
-    write4(b + 0x34, 8)
-    write4(b + 0x38, 16)
-    write4(b + 0x40, EVENT_TRACE_BUFFERING_MODE)
+    local p = EVENT_TRACE_PROPERTIES(b)
+    p.WnodeBufferSize = 0x1000
+    p.Guid.Data1 = CKCL_GUID_D1
+    p.Guid.Data2 = CKCL_GUID_W2
+    p.Guid.Data3 = CKCL_GUID_W3
+    p.Guid.Data4 = CKCL_GUID_LOW
+    p.ClientContext = 3
+    p.Flags = WNODE_FLAG_TRACED_GUID
+    p.BufferSize = 64
+    p.MinimumBuffers = 8
+    p.MaximumBuffers = 16
+    p.LogFileMode = EVENT_TRACE_BUFFERING_MODE
     if enable_flags then
-        write4(b + 0x48, EVENT_TRACE_FLAG_SYSTEMCALL)
+        p.EnableFlags = EVENT_TRACE_FLAG_SYSTEMCALL
     end
 
     local nlen = #CKCL_NAME * 2
@@ -211,10 +261,9 @@ local function fill_ckcl_struct(b, enable_flags)
     for i = 0, #CKCL_NAME do
         write2(name_buf:ref() + i * 2, read1(src + i))
     end
-    write2(b + 0x90, nlen)
-    write2(b + 0x92, nlen + 2)
-    write4(b + 0x94, 0)
-    write8(b + 0x98, name_buf:ref())
+    p.ProviderName.Length = nlen
+    p.ProviderName.MaximumLength = nlen + 2
+    p.ProviderName.Buffer = name_buf:ref()
 
     return name_buf
 end
@@ -649,12 +698,11 @@ end
 -- OBJECT_ATTRIBUTES.ObjectName UNICODE_STRING -> name string (or "")
 local function object_name(a3)
     if a3 == 0 then return "" end
-    local obj_name = read8(a3 + 0x10)
+    local obj_name = OBJECT_ATTRIBUTES(a3).ObjectName
     if obj_name == 0 then return "" end
-    local name_buf = read8(obj_name + 0x08)
-    local name_len = read2(obj_name + 0x00)
-    if name_buf == 0 or name_len == 0 then return "" end
-    return read_wstring(name_buf, name_len)
+    local us = UNICODE_STRING(obj_name)
+    if us.Buffer == 0 or us.Length == 0 then return "" end
+    return read_wstring(us.Buffer, us.Length)
 end
 
 local function deny_test_txt(a3)

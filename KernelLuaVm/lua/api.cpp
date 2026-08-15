@@ -60,6 +60,26 @@ static int l_memcmp( lua_State* L )
     return 1;
 }
 
+// Process-attach helpers. These return bool (1 byte) on the C side, so they
+// are wrapped here to push a clean 0/1 instead of leaking the upper 63 bits
+// of RAX through the native_function FFI.
+//
+static int l_attach_process( lua_State* L )
+{
+    lua_pushunsigned( L, lua::attach_process( ( PEPROCESS ) lua_tounsigned( L, 1 ) ) ? 1 : 0 );
+    return 1;
+}
+static int l_attach_pid( lua_State* L )
+{
+    lua_pushunsigned( L, lua::attach_pid( lua_tounsigned( L, 1 ) ) ? 1 : 0 );
+    return 1;
+}
+static int l_detach( lua_State* L )
+{
+    lua_pushunsigned( L, lua::detach() ? 1 : 0 );
+    return 1;
+}
+
 // Read / Write primitives. Volatile dereferences instead of memcpy so each
 // access is a single instruction under __try: a bad pointer then raises an
 // access violation caught by the SEH below (returns 0 / drops the write)
@@ -226,6 +246,205 @@ static void* read_sphys( uint64_t src, size_t n )
         return buffer;
     free( buffer );
     return nullptr;
+}
+
+// Resolve a process argument that may be either a PID or a raw EPROCESS
+// pointer. Kernel pointers occupy the 0xFFFF... canonical range, which a PID
+// can never reach, so the high bits disambiguate. Returns a referenced
+// process (caller must ObDereferenceObject) or nullptr.
+//
+static PEPROCESS resolve_process( uint64_t v )
+{
+    if ( v >= 0xFFFF000000000000ull )
+    {
+        PEPROCESS process = ( PEPROCESS ) v;
+        return ObReferenceObjectSafe( process ) ? process : nullptr;
+    }
+
+    PEPROCESS process = nullptr;
+    if ( NT_SUCCESS( PsLookupProcessByProcessId( ( HANDLE ) v, &process ) ) )
+        return process;
+    return nullptr;
+}
+
+// Read size bytes of a process's virtual memory at addr into a Lua string, or
+// nil on failure. The process may be a PID or a raw EPROCESS pointer. Attaches
+// to the target so user-mode addresses resolve in its address space; the
+// guarded copy handles paged-out pages (demand paging) and invalid addresses
+// (SEH) instead of bugchecking.
+//
+static int l_read_process_memory( lua_State* L )
+{
+    uint64_t addr = lua_tounsigned( L, 2 );
+    size_t   size = ( size_t ) lua_tounsigned( L, 3 );
+
+    if ( size == 0 )
+    {
+        lua_pushliteral( L, "" );
+        return 1;
+    }
+
+    PEPROCESS process = resolve_process( lua_tounsigned( L, 1 ) );
+    if ( !process )
+    {
+        lua_pushnil( L );
+        return 1;
+    }
+
+    void* buffer = malloc( size );
+    if ( !buffer )
+    {
+        ObDereferenceObject( process );
+        lua_pushnil( L );
+        return 1;
+    }
+
+    SIZE_T copied = 0;
+    KAPC_STATE apc_state;
+    KeStackAttachProcess( process, &apc_state );
+    __try
+    {
+        memcpy( buffer, ( void* ) addr, size );
+        copied = size;
+    }
+    __except ( 1 )
+    {
+        copied = 0;
+    }
+    KeUnstackDetachProcess( &apc_state );
+    ObDereferenceObject( process );
+
+    if ( copied == 0 )
+    {
+        free( buffer );
+        lua_pushnil( L );
+        return 1;
+    }
+
+    lua_pushlstring( L, ( const char* ) buffer, copied );
+    free( buffer );
+    return 1;
+}
+
+// Write a Lua string into a process's virtual memory at addr; returns bytes
+// written or nil on failure. The process may be a PID or a raw EPROCESS
+// pointer.
+//
+static int l_write_process_memory( lua_State* L )
+{
+    uint64_t addr = lua_tounsigned( L, 2 );
+    size_t   size = 0;
+    const char* data = lua_tolstring( L, 3, &size );
+
+    if ( size == 0 )
+    {
+        lua_pushunsigned( L, 0 );
+        return 1;
+    }
+
+    PEPROCESS process = resolve_process( lua_tounsigned( L, 1 ) );
+    if ( !process )
+    {
+        lua_pushnil( L );
+        return 1;
+    }
+
+    SIZE_T written = 0;
+    KAPC_STATE apc_state;
+    KeStackAttachProcess( process, &apc_state );
+    __try
+    {
+        memcpy( ( void* ) addr, data, size );
+        written = size;
+    }
+    __except ( 1 )
+    {
+        written = 0;
+    }
+    KeUnstackDetachProcess( &apc_state );
+    ObDereferenceObject( process );
+
+    if ( written == 0 )
+    {
+        lua_pushnil( L );
+        return 1;
+    }
+    lua_pushunsigned( L, written );
+    return 1;
+}
+
+// \Device\PhysicalMemory section handle, opened once and cached. A section
+// view is cached memory (unlike MmMapIoSpace, which maps uncached for MMIO),
+// so it is the right tool for reading RAM.
+//
+static HANDLE physmem_section()
+{
+    static HANDLE section = [ ] ()
+    {
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"\\Device\\PhysicalMemory" );
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes( &oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr );
+        HANDLE h = nullptr;
+        if ( !NT_SUCCESS( ZwOpenSection( &h, SECTION_MAP_READ | SECTION_MAP_WRITE, &oa ) ) )
+            return ( HANDLE ) nullptr;
+        return h;
+    }();
+    return section;
+}
+
+// Map a cached view of physical memory. Returns the page-aligned view base and
+// the offsetted VA (base + phys_addr & 0xFFF), or nil on failure. The view is
+// mapped into the current process, so the VAs are only valid while that
+// process is current.
+//
+static int l_map_phys( lua_State* L )
+{
+    uint64_t phys = lua_tounsigned( L, 1 );
+    size_t   size = ( size_t ) lua_tounsigned( L, 2 );
+
+    HANDLE section = physmem_section();
+    if ( !section )
+    {
+        lua_pushnil( L );
+        return 1;
+    }
+
+    uint64_t base = phys & ~0xFFFull;
+    uint64_t off  = phys & 0xFFFull;
+    size_t   view_size = ( size + ( size_t ) off + 0xFFF ) & ~0xFFFull;
+
+    LARGE_INTEGER offset;
+    offset.QuadPart = ( LONGLONG ) base;
+
+    void* view = nullptr;
+    NTSTATUS status = ZwMapViewOfSection(
+        section,
+        NtCurrentProcess(),
+        &view,
+        0,
+        0,
+        &offset,
+        &view_size,
+        ViewShare,
+        0,
+        PAGE_READWRITE
+    );
+
+    if ( !NT_SUCCESS( status ) )
+    {
+        lua_pushnil( L );
+        return 1;
+    }
+
+    lua_pushunsigned( L, ( uint64_t ) view );
+    lua_pushunsigned( L, ( uint64_t ) view + off );
+    return 2;
+}
+
+static int l_unmap_phys( lua_State* L )
+{
+    ZwUnmapViewOfSection( NtCurrentProcess(), ( void* ) lua_tounsigned( L, 1 ) );
+    return 0;
 }
 
 template<size_t N>
@@ -468,9 +687,13 @@ void lua::expose_api( lua_State* L )
     //
     export_func( L, "readps", &read_sphys );
     export_func( L, "readvs", &read_svirt );
-    export_func( L, "attach_process", &attach_process );
-    export_func( L, "attach_pid", &attach_pid );
-    export_func( L, "detach", &detach );
+    export_cfunc( L, "read_process_memory", &l_read_process_memory );
+    export_cfunc( L, "write_process_memory", &l_write_process_memory );
+    export_cfunc( L, "attach_process", &l_attach_process );
+    export_cfunc( L, "attach_pid", &l_attach_pid );
+    export_cfunc( L, "detach", &l_detach );
+    export_cfunc( L, "map_phys", &l_map_phys );
+    export_cfunc( L, "unmap_phys", &l_unmap_phys );
     export_cfunc( L, "readp1", &l_read_u64<&read_pn<1>> );
     export_cfunc( L, "readp2", &l_read_u64<&read_pn<2>> );
     export_cfunc( L, "readp4", &l_read_u64<&read_pn<4>> );
@@ -502,5 +725,13 @@ void lua::expose_api( lua_State* L )
     (
         L,
         #include "../runtime.lua"
+    );
+
+    // Run struct access library.
+    //
+    lua::execute
+    (
+        L,
+        #include "../struct.lua"
     );
 }
