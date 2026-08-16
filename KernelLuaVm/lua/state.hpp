@@ -33,7 +33,7 @@ namespace lua
 
     // Executes code in given Lua state.
     //
-    void execute( lua_State* L, const char* code, bool user_input = false );
+    void execute( lua_State* L, const char* code, bool user_input = false, const char* chunkname = "line" );
 };
 
 // Some helpers we need in Lua style.

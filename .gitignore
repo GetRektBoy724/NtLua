@@ -24,3 +24,4 @@ LuaLib/x64/Debug/
 *.recipe
 /ActualConsole/x64/Release
 /ActualConsole/ActualConsole/x64/Release
+/KernelLuaVm/x64/Release

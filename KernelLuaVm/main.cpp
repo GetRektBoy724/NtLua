@@ -107,6 +107,21 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
         //
         if ( input && input_length && input[ input_length - 1 ] == 0x0 )
         {
+            // An optional chunk name may prefix the code as "name\0code\0";
+            // when present it is used as the Lua chunk name so errors and
+            // tracebacks report the real script path instead of "line".
+            //
+            const char* code = input;
+            const char* chunkname = "line";
+            size_t name_len = 0;
+            while ( name_len < input_length && input[ name_len ] != 0 )
+                name_len++;
+            if ( name_len + 1 < input_length )
+            {
+                chunkname = input;
+                code = input + name_len + 1;
+            }
+
             struct captured_buffer
             {
                 char*  data   = nullptr;
@@ -128,7 +143,7 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
                 logger::logs.reset();
 
                 lua::begin_ctx();
-                lua::execute( L, input, true );
+                lua::execute( L, code, true, chunkname );
                 lua::end_ctx();
 
                 const auto capture = [ ] ( logger::string_buffer& buf ) -> captured_buffer

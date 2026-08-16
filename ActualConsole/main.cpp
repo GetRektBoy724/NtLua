@@ -17,13 +17,31 @@ HANDLE device = CreateFileA
     FILE_ATTRIBUTE_NORMAL,
     NULL
 );
-bool execute( const char* str, bool silent )
+bool execute( const char* str, bool silent, const char* chunkname = nullptr )
 {
-    // Issue the IOCTL.
+    // Prefix the code with an optional chunk name ("name\0code\0") so the
+    // driver can report the real script path in errors and tracebacks.
+    //
+    std::string payload;
+    const char* code = str;
+    if ( chunkname && *chunkname )
+    {
+        payload.reserve( strlen( chunkname ) + strlen( str ) + 2 );
+        payload = chunkname;
+        payload += '\0';
+        payload += str;
+        payload += '\0';
+        code = payload.data();
+    }
+
+    // Issue the IOCTL. When a chunk name is present the payload has an
+    // embedded NUL, so strlen() would stop at the name; send the full
+    // payload size (name\0code\0) instead.
     //
     DWORD discarded = 0;
     ntlua_result result = { nullptr, nullptr };
-    DeviceIoControl( device, NTLUA_RUN, ( void* ) str, strlen( str ) + 1, &result, sizeof( result ), &discarded, nullptr );
+    DWORD len = chunkname && *chunkname ? ( DWORD ) payload.size() : ( DWORD ) ( strlen( str ) + 1 );
+    DeviceIoControl( device, NTLUA_RUN, ( void* ) code, len, &result, sizeof( result ), &discarded, nullptr );
     bool had_result = result.outputs != nullptr;
 
     // If silent, free result and return.
@@ -79,7 +97,7 @@ int main( int argc, const char** argv )
 
             std::ifstream fs( argv[ n ] );
             std::string buffer{ std::istreambuf_iterator<char>( fs ), {} };
-            execute( buffer.data(), false );
+            execute( buffer.data(), false, argv[ n ] );
         }
         // Fall through to the REPL + worker thread so that scripts which
         // registered callbacks (e.g. ProcessMonitor.lua) keep running and

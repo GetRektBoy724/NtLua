@@ -97,9 +97,26 @@ namespace lua
         return ( lua_context* ) ctx;
     }
 
+    // Error handler passed to lua_pcall: appends a full stack traceback to the
+    // error message so runtime errors report the call stack with line numbers
+    // instead of a bare message.
+    //
+    static int traceback( lua_State* L )
+    {
+        const char* msg = lua_tostring( L, 1 );
+        if ( !msg )
+        {
+            if ( luaL_callmeta( L, 1, "__tostring" ) && lua_type( L, -1 ) == LUA_TSTRING )
+                return 1;
+            msg = lua_pushfstring( L, "(error object is a %s value)", luaL_typename( L, 1 ) );
+        }
+        luaL_traceback( L, L, msg, 1 );
+        return 1;
+    }
+
     // Executes code in given Lua state.
     //
-    void execute( lua_State* L, const char* code, bool user_input )
+    void execute( lua_State* L, const char* code, bool user_input, const char* chunkname )
     {
         size_t len = strlen( code );
         if ( !len ) return;
@@ -115,7 +132,7 @@ namespace lua
         {
             // Try to load the buffer.
             //
-            if ( luaL_loadbuffer( L, code, len, "line" ) )
+            if ( luaL_loadbuffer( L, code, len, chunkname ) )
             {
                 logger::error( "Lua parser error: %s\n", lua_tostring( L, -1 ) );
                 return;
@@ -127,7 +144,14 @@ namespace lua
             {
                 // Guard against any virtual exceptions.
                 //
-                if ( lua_pcall( L, 0, user_input ? LUA_MULTRET : 0, 0 ) )
+                int base = lua_gettop( L );   // chunk is at the top
+                lua_pushcfunction( L, &traceback );
+                lua_insert( L, base );        // move handler under the chunk
+
+                int status = lua_pcall( L, 0, user_input ? LUA_MULTRET : 0, base );
+                lua_remove( L, base );        // drop the handler
+
+                if ( status )
                 {
                     logger::error( "Lua runtime error: %s\n", lua_tostring( L, -1 ) );
                 }
