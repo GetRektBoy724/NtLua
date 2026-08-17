@@ -121,10 +121,12 @@ namespace lua
         size_t len = strlen( code );
         if ( !len ) return;
 
-        // Reset the Lua stack.
+        // Stack-neutral discipline: handlers can dispatch nested inside this
+        // function's live lua_pcall frames (same-thread callback re-entry via
+        // the FFI), so every VM entry point must leave the top where it found
+        // it, pop what it pushed, and never clear to zero.
         //
-        if ( user_input )
-            lua_settop( L, 0 );
+        int entry = lua_gettop( L );
 
         // Guard against Lua panic.
         //
@@ -135,6 +137,7 @@ namespace lua
             if ( luaL_loadbuffer( L, code, len, chunkname ) )
             {
                 logger::error( "Lua parser error: %s\n", lua_tostring( L, -1 ) );
+                lua_pop( L, 1 );
                 return;
             }
 
@@ -154,21 +157,25 @@ namespace lua
                 if ( status )
                 {
                     logger::error( "Lua runtime error: %s\n", lua_tostring( L, -1 ) );
+                    lua_pop( L, 1 );
                 }
                 // If not internal and we have something left on stack:
                 //
-                else if ( user_input && lua_gettop( L ) > 0 )
+                else if ( user_input && lua_gettop( L ) > entry )
                 {
                     // Redirect to print.
                     //
                     lua_getglobal( L, "print" );
-                    lua_insert( L, 1 );
-                    lua_pcall( L, lua_gettop( L ) - 1, 0, 0 );
+                    lua_insert( L, entry + 1 );
+                    lua_pcall( L, lua_gettop( L ) - ( entry + 1 ), 0, 0 );
                 }
+
+                lua_settop( L, entry );
             }
             __except ( 1 )
             {
                 logger::error( "Lua SEH error: %x\n", GetExceptionCode() );
+                lua_settop( L, entry );
             }
         }
         else

@@ -6,7 +6,7 @@
 #include "lua/native_function.hpp"
 #include "driver_io.hpp"
 #include "lua/api.hpp"
-#include "callback.hpp"
+#include "lua/callback.hpp"
 
 #pragma intrinsic(_enable)
 
@@ -90,6 +90,12 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
         unique_lock _g{ LL };
         lua::destroy( L );
         L = lua::init();
+
+        // A reset VM is useless without its API (the old code re-created a
+        // bare state with no globals exposed).
+        //
+        lua::expose_api( L );
+        callback::expose_api( L );
     }
     else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RUN )
     {

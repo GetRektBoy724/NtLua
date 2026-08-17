@@ -724,7 +724,7 @@ void lua::expose_api( lua_State* L )
     lua::execute
     (
         L,
-        #include "../runtime.lua"
+        #include "../runtime/runtime.lua"
     );
 
     // Run struct access library.
@@ -732,6 +732,14 @@ void lua::expose_api( lua_State* L )
     lua::execute
     (
         L,
-        #include "../struct.lua"
+        #include "../runtime/struct.lua"
+    );
+
+    // Run admission-gate compiler.
+    //
+    lua::execute
+    (
+        L,
+        #include "../runtime/gate.lua"
     );
 }

@@ -155,6 +155,9 @@
     <ClCompile Include="lua\api.cpp">
       <Filter>lua</Filter>
     </ClCompile>
+    <ClCompile Include="lua\callback.cpp">
+      <Filter>lua</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="crt">
@@ -168,6 +171,9 @@
     </Filter>
     <Filter Include="lua">
       <UniqueIdentifier>{c93e1f28-6e3d-4491-9813-a370a623d96b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="runtimes">
+      <UniqueIdentifier>{699a6f4d-ff71-4c8e-8226-80cd2987f248}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -191,8 +197,19 @@
     <ClInclude Include="lua\api.hpp">
       <Filter>lua</Filter>
     </ClInclude>
+    <ClInclude Include="lua\callback.hpp">
+      <Filter>lua</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <None Include="runtime.lua" />
+    <None Include="runtime\runtime.lua">
+      <Filter>runtimes</Filter>
+    </None>
+    <None Include="runtime\struct.lua">
+      <Filter>runtimes</Filter>
+    </None>
+    <None Include="runtime\gate.lua">
+      <Filter>runtimes</Filter>
+    </None>
   </ItemGroup>
 </Project>

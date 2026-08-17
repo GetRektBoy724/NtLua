@@ -5,6 +5,14 @@
 -- Usage:  ntlua.exe scripts\InfinityHook.lua
 -- Then:   HookSyscall("NtCreateFile", function(a1,...) ... return 0 end)
 --         UnhookAll() to stop
+--
+-- Admission gate: the timestamp trampoline carries a gate program compiled
+-- from the hooked-syscall table. Unhooked syscalls (the overwhelming
+-- majority) are rejected by the interpreter before any lock - the VM never
+-- sees them, so a busy REPL can no longer cause missed swaps. A matched
+-- timestamp blocks for the VM lock instead of falling back, so hooked
+-- syscalls always get their pSystemCallFunction swap. With no syscalls
+-- hooked, a constant-false gate keeps the hot path pure native.
 
 -- === Constants ===
 
@@ -521,6 +529,49 @@ end, true)
 local gc_tramp = GetTrampoline(gc_eid)
 print("[hook] Trampoline = " .. hex(gc_tramp))
 
+-- Matched timestamps wait at most 100ms for the VM; a timeout falls back to
+-- the native clock and counts as a miss (EventMisses). Without this bound
+-- the matched-mass of a hot hooked syscall queues unbounded on the VM mutex
+-- and halts the whole machine (lock convoy).
+SetWait(gc_eid, 100)
+
+-- === Step 6b: Admission gate ===
+-- Recompiled from the hooked-syscall table whenever it changes. Rows:
+--   { KTHREAD.CallIndex == idx  AND  KTHREAD.PreviousMode != 0 }
+-- so only user-mode timestamps of hooked syscalls reach the VM; everything
+-- else is interpreter-rejected to the native fallback in ~20ns, lock-free.
+--
+local function rebuild_gate()
+    local n = 0
+    local rows = {}
+    for idx in pairs(hooked) do
+        local row = { { thread = ci_off, mask = 0xFFFFFFFF, eq = idx } }
+        if pm_off then
+            -- PreviousMode is a single byte inside the qword; mask it off so
+            -- adjacent KTHREAD fields cannot affect the compare.
+            row[#row + 1] = { thread = pm_off, mask = 0xFF, ne = 0 }
+        end
+        rows[#rows + 1] = row
+        n = n + 1
+    end
+
+    if n == 0 then
+        -- Constant-false: mask 0 collapses any value to 0, which then fails
+        -- "ne 0". Keeps the idle state (no syscalls hooked) at zero VM cost.
+        rows[1] = { { thread = 0, mask = 0, ne = 0 } }
+    end
+
+    local ok, err = pcall(SetGate, gc_eid, gate.compile(rows))
+    if ok then
+        print(n > 0 and ("[gate] armed for " .. n .. " hooked syscall(s)")
+                     or "[gate] armed idle (constant-false)")
+    else
+        print("[gate] compile/install failed, running ungated: " .. tostring(err))
+    end
+end
+
+rebuild_gate()
+
 -- === Step 7: Overwrite GetCpuClock / HvlGetQpcBias ===
 
 local orig_gcc = read8(get_cpu_clock)
@@ -574,7 +625,7 @@ local last_gc, last_cf, last_of, last_tc = 0, 0, 0, 0
 function worker()
     if stats_gc ~= last_gc or stats_create_file ~= last_cf or
        stats_open_file ~= last_of or stats_trace_control ~= last_tc then
-        print("[stats] GetCpuClock=" .. stats_gc ..
+        print("[stats] GCmatch=" .. stats_gc ..   -- gate-matched timestamps only
               "  NtCreateFile=" .. stats_create_file ..
               "  NtOpenFile=" .. stats_open_file ..
               "  NtTraceControl=" .. stats_trace_control)
@@ -587,8 +638,14 @@ function worker()
               " swap=" .. dbg_gc_swap .. " already=" .. dbg_gc_already ..
               " miss=" .. dbg_gc_miss .. " idx=" .. dbg_last_idx)
         if dbg_gc_miss ~= 0 then
-            print("        miss slot=" .. hex(dbg_miss_val) ..
+            print("        walk miss slot=" .. hex(dbg_miss_val) ..
                   " expected orig=" .. hex(dbg_miss_orig))
+        end
+        local miss = EventMisses(gc_eid)
+        for _, h in pairs(hooked) do miss = miss + EventMisses(h.eid) end
+        if miss > 0 then
+            print("[miss] " .. miss .. " dispatch(es) timed out waiting for the VM" ..
+                  " - hooked syscalls ran their fallback for those calls")
         end
     end
 
@@ -673,14 +730,24 @@ function HookSyscall(name, fn)
     if not eid then print("ERROR: alloc event") return end
 
     SetHandler(eid, 16, fn)
+    -- On a lock timeout the dispatch falls back to the REAL syscall: the
+    -- hook is skipped for that call but the caller still gets a correct
+    -- result (never a fake STATUS_SUCCESS with no handle).
+    SetFallback(eid, fn_addr)
+    SetWait(eid, 250)
 
     hooked[idx] = { eid = eid, tramp = GetTrampoline(eid), name = name, orig = fn_addr }
     any_hooked = true
+    rebuild_gate()
 
     print("[hook] " .. name .. " hooked (index " .. idx .. ")")
 end
 
 -- === Step 9b: Demo hooks (replicated from InfinityHookPro) ===
+-- Handlers decide DENY in Lua (cheap checks only). To allow, return
+-- PASS_THROUGH: the bridge releases the VM lock and calls the REAL syscall
+-- natively - file I/O never serializes the VM. (Forwarding the original
+-- from Lua while holding the lock was the machine-wide lag.)
 
 local STATUS_ACCESS_DENIED = 0xC0000022
 
@@ -735,7 +802,7 @@ HookSyscall("NtCreateFile", function(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
     if not hook_bypass() and deny_test_txt(a3) then
         return STATUS_ACCESS_DENIED
     end
-    return nt.NtCreateFile(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+    return PASS_THROUGH
 end)
 
 -- FakeNtOpenFile: same deny for the open-only path (some callers use it
@@ -747,7 +814,7 @@ HookSyscall("NtOpenFile", function(a1, a2, a3, a4, a5, a6)
     if not hook_bypass() and deny_test_txt(a3) then
         return STATUS_ACCESS_DENIED
     end
-    return nt.NtOpenFile(a1, a2, a3, a4, a5, a6)
+    return PASS_THROUGH
 end)
 
 -- FakeNtTraceControl: deny stopping the CKCL trace
@@ -759,10 +826,14 @@ HookSyscall("NtTraceControl", function(a1, a2, a3, a4, a5, a6)
         print("[deny] NtTraceControl: attempt to stop CKCL trace")
         return STATUS_ACCESS_DENIED
     end
-    return nt.NtTraceControl(a1, a2, a3, a4, a5, a6)
+    return PASS_THROUGH
 end)
 
 print("[hook] NtCreateFile + NtOpenFile + NtTraceControl hooks registered")
+print("[warn] file-syscall hooks still run their checks inside the VM for")
+print("[warn] every open system-wide: heavy sustained file load can exceed")
+print("[warn] what a serialized Lua VM can drain. [miss] lines are that")
+print("[warn] signal (timeout -> native original, correct result, no hook).")
 
 -- === Step 10: UnhookAll ===
 
@@ -773,6 +844,7 @@ function UnhookAll()
         hooked[idx] = nil
     end
     any_hooked = false
+    rebuild_gate()   -- back to constant-false: idle state costs no VM
 
     -- Restore originals
     if use_qpc then

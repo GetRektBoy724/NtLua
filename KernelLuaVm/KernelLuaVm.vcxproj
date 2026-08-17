@@ -147,9 +147,9 @@
     <ClCompile Include="crt\memory.cpp" />
     <ClCompile Include="crt\misc.c" />
     <ClCompile Include="lua\api.cpp" />
+    <ClCompile Include="lua\callback.cpp" />
     <ClCompile Include="lua\native_function.cpp" />
     <ClCompile Include="lua\state.cpp" />
-    <ClCompile Include="callback.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -161,14 +161,15 @@
     <ClInclude Include="crt\stdint.h" />
     <ClInclude Include="driver_io.hpp" />
     <ClInclude Include="logger.hpp" />
-    <ClInclude Include="callback.hpp" />
     <ClInclude Include="lua\api.hpp" />
+    <ClInclude Include="lua\callback.hpp" />
     <ClInclude Include="lua\native_function.hpp" />
     <ClInclude Include="lua\state.hpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="runtime.lua" />
-    <None Include="struct.lua" />
+    <None Include="runtime\runtime.lua" />
+    <None Include="runtime\struct.lua" />
+    <None Include="runtime\gate.lua" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

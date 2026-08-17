@@ -1,8 +1,8 @@
 #pragma once
-#include "crt/crt.h"
+#include "../crt/crt.h"
 #include <ntifs.h>
 #include <intrin.h>
-#include "lua/state.hpp"
+#include "state.hpp"
 
 // VM lock with owner tracking (for callback reentrancy detection).
 // Moved here from main.cpp so both main.cpp and callback.cpp can use it.
@@ -33,6 +33,16 @@ struct vm_lock
         // wrong here: a busy mutex expires the zero-length wait and returns
         // STATUS_TIMEOUT WITHOUT acquiring ownership. Releasing a mutex we
         // never owned raises STATUS_MUTANT_NOT_OWNED (bugcheck 0x3B).
+        if ( status == STATUS_TIMEOUT )
+            return false;
+        owner = (void*) KeGetCurrentThread();
+        return true;
+    }
+    bool lock_for( uint32_t ms )
+    {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -10000i64 * ms;
+        NTSTATUS status = KeWaitForSingleObject( &mutex, Executive, KernelMode, FALSE, &timeout );
         if ( status == STATUS_TIMEOUT )
             return false;
         owner = (void*) KeGetCurrentThread();
