@@ -94,14 +94,23 @@ namespace callback
     //
     void init();
 
-    // Destroy the callback subsystem (call in unload, before lua::destroy).
-    // Marks all event slots inactive so trampolines become no-ops.
+    // Stop new dispatches and wait for already-running trampolines.
     //
-    void destroy();
+    void begin_teardown();
+
+    // Run registered Lua cleanup callbacks while L is still valid.
+    //
+    void run_teardown( lua_State* L );
+
+    // Clear callback and teardown registry references from L.
+    //
+    void destroy( lua_State* L );
 
     // Expose callback Lua API to a Lua state.
     // Adds: AllocateEvent, SetHandler, GetTrampoline, FreeEvent,
-    //       SetFallback, SetFallbackValue, ClearFallback.
+    //       SetFallback, SetFallbackValue, ClearFallback, SetGate,
+    //       SetWait, EventMisses, OnTeardown, TrackPatch, RestorePatch,
+    //       RestoreAllPatches, PASS_THROUGH.
     //
     void expose_api( lua_State* L );
 

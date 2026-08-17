@@ -578,10 +578,28 @@ local orig_gcc = read8(get_cpu_clock)
 local orig_bias = nil
 local orig_rt  = nil
 local rt_eid   = nil
+local gcc_patch = nil
+local bias_patch = nil
+local rt_patch = nil
+
+OnTeardown(function()
+    if UnhookAll then
+        local ok, err = pcall(UnhookAll)
+        if not ok then print("[teardown] InfinityHook restore failed: " .. tostring(err)) end
+        return
+    end
+
+    if rt_patch then RestorePatch(rt_patch) end
+    if bias_patch then RestorePatch(bias_patch) end
+    if gcc_patch then RestorePatch(gcc_patch) end
+    if rt_eid then FreeEvent(rt_eid) end
+    if gc_eid then FreeEvent(gc_eid) end
+end)
 
 if use_qpc then
     -- Set *GetCpuClock = 2 (magic value, forces HvlGetQpcBias path)
-    write8(get_cpu_clock, 2)
+    gcc_patch = TrackPatch(get_cpu_clock, 2)
+    if gcc_patch == nil then error("could not track GetCpuClock patch", 0) end
     print("[hook] GetCpuClock = 2")
 
     -- Overwrite *HvlGetQpcBias with our trampoline. If the VM can't run
@@ -589,7 +607,8 @@ if use_qpc then
     -- clock returns a real timestamp instead of 0.
     orig_bias = read8(hvl_bias)
     SetFallback(gc_eid, orig_bias, 8)
-    write8(hvl_bias, gc_tramp)
+    bias_patch = TrackPatch(hvl_bias, gc_tramp)
+    if bias_patch == nil then error("could not track HvlGetQpcBias patch", 0) end
     print("[hook] HvlGetQpcBias overwritten")
 
     -- Optionally overwrite HvlpGetReferenceTimeUsingTscPage if it's 0
@@ -599,7 +618,11 @@ if use_qpc then
             local rt_eid_local = AllocateEvent()
             if rt_eid_local then
                 SetHandler(rt_eid_local, 0, function() return readtsc() end, true)
-                write8(hvlp_rt, GetTrampoline(rt_eid_local))
+                rt_patch = TrackPatch(hvlp_rt, GetTrampoline(rt_eid_local))
+                if rt_patch == nil then
+                    FreeEvent(rt_eid_local)
+                    error("could not track reference-time patch", 0)
+                end
                 rt_eid = rt_eid_local
                 print("[hook] HvlpGetReferenceTimeUsingTscPage = rdtsc stub")
             end
@@ -608,7 +631,8 @@ if use_qpc then
 else
     -- Win7 to Win10 1909: directly overwrite GetCpuClock
     SetFallback(gc_eid, orig_gcc, 8)
-    write8(get_cpu_clock, gc_tramp)
+    gcc_patch = TrackPatch(get_cpu_clock, gc_tramp)
+    if gcc_patch == nil then error("could not track GetCpuClock patch", 0) end
     print("[hook] GetCpuClock overwritten")
 end
 
@@ -651,17 +675,14 @@ function worker()
 
     if use_qpc then
         if hvl_bias and read8(hvl_bias) ~= gc_tramp then
-            write8(hvl_bias, gc_tramp)
-            print("[heal] HvlGetQpcBias re-installed")
+            print("[warn] HvlGetQpcBias patch was changed externally")
         end
         if get_cpu_clock and read8(get_cpu_clock) ~= 2 then
-            write8(get_cpu_clock, 2)
-            print("[heal] GetCpuClock re-set to 2")
+            print("[warn] GetCpuClock patch was changed externally")
         end
     else
         if get_cpu_clock and read8(get_cpu_clock) ~= gc_tramp then
-            write8(get_cpu_clock, gc_tramp)
-            print("[heal] GetCpuClock re-installed")
+            print("[warn] GetCpuClock patch was changed externally")
         end
     end
 end
@@ -849,17 +870,14 @@ function UnhookAll()
     -- Restore originals
     if use_qpc then
         if rt_eid then FreeEvent(rt_eid) end
-        if orig_rt ~= nil and orig_rt == 0 and hvlp_rt then
-            write8(hvlp_rt, orig_rt)
-        end
-        if orig_bias and hvl_bias then
-            write8(hvl_bias, orig_bias)
-        end
+        if rt_patch then RestorePatch(rt_patch) end
+        if bias_patch then RestorePatch(bias_patch) end
         print("[stop] Restored HvlGetQpcBias + GetCpuClock")
     end
-    write8(get_cpu_clock, orig_gcc)
+    if gcc_patch then RestorePatch(gcc_patch) end
 
     FreeEvent(gc_eid)
+    rt_patch, bias_patch, gcc_patch = nil, nil, nil
     worker = nil
     print("[stop] InfinityHook stopped")
 end

@@ -673,10 +673,15 @@ function hook_callback(e, fn, argc)
         return false
     end
 
-    write8(e.fn_addr, tramp)
+    local patch = TrackPatch(e.fn_addr, tramp)
+    if not patch then
+        FreeEvent(eid)
+        return false
+    end
     e.orig = e.address
     e.eid = eid
     e.tramp = tramp
+    e.patch = patch
     e.hooked = true
     hooked[#hooked + 1] = e
     return true
@@ -685,18 +690,19 @@ end
 -- Restore a hooked callback's original function pointer and free the event.
 function unhook_callback(e)
     if not e or not e.hooked then return false end
-    write8(e.fn_addr, e.orig)
+    local restored = RestorePatch(e.patch)
     FreeEvent(e.eid)
     e.hooked = false
     e.eid = nil
     e.tramp = nil
+    e.patch = nil
     for i, x in ipairs(hooked) do
         if x == e then
             table.remove(hooked, i)
             break
         end
     end
-    return true
+    return restored
 end
 
 -- Restore all hooked callbacks.
@@ -709,6 +715,14 @@ function unhook_all()
     end
     return n
 end
+
+OnTeardown(function()
+    local ok, err = pcall(function()
+        unhook_all()
+        restore_all()
+    end)
+    if not ok then print("[teardown] callback restore failed: " .. tostring(err)) end
+end)
 
 -- === Run ===
 

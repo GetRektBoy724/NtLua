@@ -15,6 +15,9 @@ Well you've come to the right place to run a scripting language at `DPC_LEVEL`!
 3) Start the NtLua service `sc start NtLua`
 4) Run the console and enjoy!
 
+See [docs/NtLua.md](docs/NtLua.md) for the complete architecture, lifecycle,
+Lua API, callback bridge, gate, patch-tracking, and script reference.
+
 # Horrible samples for horrible people
 ![](https://i.can.ac/vq7g1.png)
 ![](https://i.can.ac/OKncG.png)
@@ -28,12 +31,13 @@ Well you've come to the right place to run a scripting language at `DPC_LEVEL`!
 - Garbage collected temporaries
 - UNICODE_STRING/ANSI_STRING via `unicode_string(str) and ansi_string(str)`
 - Automatic importing of entire kernel images
+- Native callback trampolines with fallback dispatch
+- Script-authored admission gates for hot callback paths
+- Tracked pointer patches and teardown callbacks
 
 ## Under development:
 - File importing via UM console
 - Symbol parsing for internal functions and structure declarations
-- Lua to C callback wrapping
-- Multi-thread support
 - HIGH_LEVEL IRQL support
 - Other fun stuff you are considering to contribute.
 

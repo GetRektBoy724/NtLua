@@ -17,6 +17,8 @@ namespace lua
         // Jump buffer taken on Lua panic.
         //
         jmp_buf panic_jump = {};
+        volatile void* panic_owner = nullptr;
+        volatile LONG panic_active = 0;
     };
 
     // Initializes a Lua state.

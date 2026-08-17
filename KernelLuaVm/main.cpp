@@ -14,14 +14,20 @@
 //
 lua_State* L = nullptr;
 vm_lock LL = {};
+IO_REMOVE_LOCK remove_lock = {};
 
 PEPROCESS attached_process = nullptr;
 KAPC_STATE apc_state;
+volatile void* context_owner = nullptr;
+bool context_active = false;
+bool process_attached = false;
 
 namespace lua
 {
     static void begin_ctx()
     {
+        context_owner = ( void* ) KeGetCurrentThread();
+        context_active = true;
         if ( attached_process )
         {
             if ( PsGetProcessExitStatus( attached_process ) != STATUS_PENDING )
@@ -32,6 +38,7 @@ namespace lua
             else
             {
                 KeStackAttachProcess( attached_process, &apc_state );
+                process_attached = true;
             }
         }
     }
@@ -39,40 +46,61 @@ namespace lua
     {
         __writecr8( 0 );
         _enable();
-        if ( attached_process )
+        if ( process_attached )
+        {
             KeUnstackDetachProcess( &apc_state );
+            process_attached = false;
+        }
+        context_active = false;
+        context_owner = nullptr;
     }
 
     bool detach()
     {
-        if ( !attached_process )
+        if ( !context_active || context_owner != ( void* ) KeGetCurrentThread() )
             return false;
-        KeUnstackDetachProcess( &apc_state );
+        if ( process_attached )
+        {
+            KeUnstackDetachProcess( &apc_state );
+            process_attached = false;
+        }
         ObDereferenceObject( attached_process );
         attached_process = nullptr;
         return true;
     }
     bool attach_process( PEPROCESS process )
     {
-        if ( ObReferenceObjectSafe( process ) )
-        {
-            detach();
-            attached_process = process;
-            KeStackAttachProcess( process, &apc_state );
-            return true;
-        }
-        return false;
-    }
-    bool attach_pid( uint64_t pid )
-    {
-        PEPROCESS process = nullptr;
-        PsLookupProcessByProcessId( ( HANDLE ) pid, &process );
-        if ( !process ) 
+        if ( !context_active || context_owner != ( void* ) KeGetCurrentThread() )
+            return false;
+        if ( !ObReferenceObjectSafe( process ) )
             return false;
 
         detach();
         attached_process = process;
         KeStackAttachProcess( process, &apc_state );
+        process_attached = true;
+        return true;
+    }
+    bool attach_pid( uint64_t pid )
+    {
+        if ( !context_active || context_owner != ( void* ) KeGetCurrentThread() )
+            return false;
+
+        PEPROCESS process = nullptr;
+        PsLookupProcessByProcessId( ( HANDLE ) pid, &process );
+        if ( !process ) 
+            return false;
+
+        if ( process_attached )
+        {
+            KeUnstackDetachProcess( &apc_state );
+            process_attached = false;
+        }
+        if ( attached_process )
+            ObDereferenceObject( attached_process );
+        attached_process = process;
+        KeStackAttachProcess( process, &apc_state );
+        process_attached = true;
         return true;
     }
 };
@@ -81,24 +109,55 @@ namespace lua
 //
 NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
 {
+    NTSTATUS remove_status = IoAcquireRemoveLock( &remove_lock, irp );
+    if ( !NT_SUCCESS( remove_status ) )
+    {
+        irp->IoStatus.Status = remove_status;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+        return remove_status;
+    }
+
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation( irp );
 
     // Handle the command.
     //
     if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RESET )
     {
+        callback::begin_teardown();
         unique_lock _g{ LL };
+        callback::run_teardown( L );
+        callback::destroy( L );
         lua::destroy( L );
         L = lua::init();
+        if ( !L )
+        {
+            callback::init();
+            irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
 
         // A reset VM is useless without its API (the old code re-created a
         // bare state with no globals exposed).
         //
         lua::expose_api( L );
+        callback::init();
         callback::expose_api( L );
     }
     else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RUN )
     {
+        if ( !L )
+        {
+            irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_DEVICE_NOT_READY;
+        }
+
         const char* input = ( const char* ) irp->AssociatedIrp.SystemBuffer;
         ntlua_result* result = ( ntlua_result* ) irp->AssociatedIrp.SystemBuffer;
 
@@ -216,6 +275,7 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
         // Report failure.
         //
         irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
+        IoReleaseRemoveLock( &remove_lock, irp );
         IoCompleteRequest( irp, IO_NO_INCREMENT );
         return STATUS_UNSUCCESSFUL;
     }
@@ -223,6 +283,7 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
     // Declare success and return.
     //
     irp->IoStatus.Status = STATUS_SUCCESS;
+    IoReleaseRemoveLock( &remove_lock, irp );
     IoCompleteRequest( irp, IO_NO_INCREMENT );
     return STATUS_SUCCESS;
 }
@@ -231,13 +292,17 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
 //
 void unload_driver( PDRIVER_OBJECT driver )
 {
+    IoReleaseRemoveLockAndWait( &remove_lock, nullptr );
+
     // Deactivate all callbacks (trampolines become no-ops).
     //
-    callback::destroy();
+    callback::begin_teardown();
 
     // Destroy the Lua context.
     //
     unique_lock _g{ LL };
+    callback::run_teardown( L );
+    callback::destroy( L );
     lua::destroy( L );
 
     // Delete the symbolic link.
@@ -256,8 +321,18 @@ void unload_driver( PDRIVER_OBJECT driver )
 //
 NTSTATUS security_check( PDEVICE_OBJECT device_object, PIRP irp )
 {
+    NTSTATUS remove_status = IoAcquireRemoveLock( &remove_lock, irp );
+    if ( !NT_SUCCESS( remove_status ) )
+    {
+        irp->IoStatus.Status = remove_status;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+        return remove_status;
+    }
+
     irp->IoStatus.Status = STATUS_SUCCESS;
     irp->IoStatus.Information = 0;
+    IoReleaseRemoveLock( &remove_lock, irp );
     IoCompleteRequest( irp, IO_NO_INCREMENT );
     return STATUS_SUCCESS;
 }
@@ -293,6 +368,8 @@ extern "C" NTSTATUS DriverEntry( DRIVER_OBJECT* DriverObject, UNICODE_STRING* Re
     if ( !NT_SUCCESS( nt_status ) )
         return nt_status;
 
+    IoInitializeRemoveLock( &remove_lock, 0x4E744C75, 0, 0 );
+
     // Set callbacks.
     //
     DriverObject->DriverUnload = &unload_driver;
@@ -314,6 +391,12 @@ extern "C" NTSTATUS DriverEntry( DRIVER_OBJECT* DriverObject, UNICODE_STRING* Re
     // Initialize Lua.
     //
     L = lua::init();
+    if ( !L )
+    {
+        IoDeleteSymbolicLink( &dos_device );
+        IoDeleteDevice( device_object );
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     lua::expose_api( L );
 
     // Initialize the universal callback bridge.

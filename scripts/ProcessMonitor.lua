@@ -91,6 +91,8 @@ print("Process monitor active.")
 print("Try launching a process (e.g. type 'cmd' here).")
 print("Call StopProcessMonitor() to stop.")
 
+local active = true
+
 -- === Worker ===
 
 local last_count = 0
@@ -109,9 +111,19 @@ end
 -- === Cleanup ===
 
 function StopProcessMonitor()
+    if not active then return false end
+    active = false
     local status = nt.PsSetCreateProcessNotifyRoutine(tramp, 1)
     print(string.format("[stop] Process monitor deregistered: status=0x%08X", status & 0xFFFFFFFF))
     FreeEvent(eid)
     worker = nil
     print("Process monitor stopped (total callbacks: " .. callback_count .. ")")
+    return status == 0
 end
+
+OnTeardown(function()
+    if active then
+        local ok, err = pcall(StopProcessMonitor)
+        if not ok then print("[teardown] Process monitor restore failed: " .. tostring(err)) end
+    end
+end)

@@ -64,8 +64,11 @@ namespace lua
     static int panic( lua_State* L )
     {
         const char* message = lua_tostring( L, -1 );
-        logger::error( "Runtime error: %s\n", message );
-        longjmp( get_context( L )->panic_jump, 1 );
+        logger::error( "Runtime error: %s\n", message ? message : "(non-string error object)" );
+        lua_context* context = get_context( L );
+        if ( context->panic_active &&
+             context->panic_owner == ( void* ) KeGetCurrentThread() )
+            longjmp( context->panic_jump, 1 );
         return 0;
     }
 
@@ -84,8 +87,9 @@ namespace lua
     //
     void destroy( lua_State* L )
     {
-        delete get_context( L );
+        lua_context* context = get_context( L );
         lua_close( L );
+        delete context;
     }
 
     // Gets current context from a Lua state.
@@ -127,6 +131,9 @@ namespace lua
         // it, pop what it pushed, and never clear to zero.
         //
         int entry = lua_gettop( L );
+        lua_context* context = lua::get_context( L );
+        context->panic_owner = ( void* ) KeGetCurrentThread();
+        context->panic_active = 1;
 
         // Guard against Lua panic.
         //
@@ -138,6 +145,8 @@ namespace lua
             {
                 logger::error( "Lua parser error: %s\n", lua_tostring( L, -1 ) );
                 lua_pop( L, 1 );
+                context->panic_active = 0;
+                context->panic_owner = nullptr;
                 return;
             }
 
@@ -182,6 +191,9 @@ namespace lua
         {
             logger::error( "Lua Panic!" );
         }
+
+        context->panic_active = 0;
+        context->panic_owner = nullptr;
     }
 };
 

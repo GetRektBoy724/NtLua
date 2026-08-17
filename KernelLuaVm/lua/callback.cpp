@@ -16,7 +16,7 @@
 // unit 1 -> *(uint64*)(rsp + index), index = byte offset (<= 0xFFF,
 // bounds-checked against stack_base at evaluation time),
 // unit 2 -> *(uint64*)(thread + index), the KTHREAD captured at trap time
-// (index <= 0x400, inside the always-resident KTHREAD header).
+// (index <= 0x500, inside the always-resident KTHREAD header).
 // Conditions within a row AND; rows OR; OP_OR terminates a row, the program
 // ends with OP_STOP.
 //
@@ -71,6 +71,25 @@ struct callback_registration
 static callback_registration cb_registry[ callback::MAX_EVENTS ];
 static KSPIN_LOCK             cb_registry_lock;
 static void*                  cb_trampoline_table[ callback::MAX_EVENTS ];
+static EX_RUNDOWN_REF         callback_rundown;
+static bool                   callback_rundown_initialized = false;
+
+static constexpr int MAX_TEARDOWN_CALLBACKS = 32;
+static int teardown_refs[ MAX_TEARDOWN_CALLBACKS ];
+static volatile bool accepting_teardown = false;
+
+struct tracked_patch
+{
+    uint64_t target      = 0;
+    uint64_t original    = 0;
+    uint64_t replacement = 0;
+    uint8_t  width       = 8;
+    bool     active      = false;
+};
+
+static constexpr int MAX_TRACKED_PATCHES = 256;
+static tracked_patch tracked_patches[ MAX_TRACKED_PATCHES ];
+static LONG64 patch_conflicts = 0;
 
 // - Capture Trampoline Template -
 //
@@ -181,7 +200,7 @@ static uint64_t gate_load( uint64_t selector, const uint64_t args[ 16 ], uint64_
     // Thread reads hit the KTHREAD of the trapped thread (nonpaged, valid
     // for the whole dispatch - the thread cannot exit mid-syscall).
     //
-    if ( unit == 2 && index <= 0x400 )
+    if ( unit == 2 && index <= 0x500 )
         return *( volatile uint64_t* ) ( thread + index );
 
     ok = false;
@@ -322,7 +341,7 @@ static uint64_t run_handler( int event_id, const uint64_t args[16], uint64_t thr
 //
 namespace callback
 {
-    uint64_t dispatch( int event_id, uint64_t args[16], uint64_t thread, uint64_t stack_base, uint64_t rsp )
+    static uint64_t dispatch_active( int event_id, uint64_t args[16], uint64_t thread, uint64_t stack_base, uint64_t rsp )
     {
         // Bounds check.
         //
@@ -404,21 +423,133 @@ namespace callback
         return result;
     }
 
+    uint64_t dispatch( int event_id, uint64_t args[16], uint64_t thread, uint64_t stack_base, uint64_t rsp )
+    {
+        if ( event_id < 0 || event_id >= MAX_EVENTS ||
+             !ExAcquireRundownProtection( &callback_rundown ) )
+            return 0;
+
+        uint64_t result = 0;
+        __try
+        {
+            result = dispatch_active( event_id, args, thread, stack_base, rsp );
+        }
+        __except ( 1 )
+        {
+            logger::error( "callback %d dispatch SEH: %x\n", event_id, GetExceptionCode() );
+        }
+        ExReleaseRundownProtection( &callback_rundown );
+        return result;
+    }
+
+    static bool patch_read( uint64_t address, uint8_t width, uint64_t& value )
+    {
+        value = 0;
+        __try
+        {
+            switch ( width )
+            {
+                case 1: value = *( volatile uint8_t* ) address; break;
+                case 2: value = *( volatile uint16_t* ) address; break;
+                case 4: value = *( volatile uint32_t* ) address; break;
+                case 8: value = *( volatile uint64_t* ) address; break;
+                default: return false;
+            }
+        }
+        __except ( 1 )
+        {
+            return false;
+        }
+        return true;
+    }
+
+    static bool patch_write( uint64_t address, uint8_t width, uint64_t value )
+    {
+        __try
+        {
+            switch ( width )
+            {
+                case 1: *( volatile uint8_t* ) address = ( uint8_t ) value; break;
+                case 2: *( volatile uint16_t* ) address = ( uint16_t ) value; break;
+                case 4: *( volatile uint32_t* ) address = ( uint32_t ) value; break;
+                case 8: *( volatile uint64_t* ) address = value; break;
+                default: return false;
+            }
+        }
+        __except ( 1 )
+        {
+            return false;
+        }
+        return true;
+    }
+
+    static bool restore_all_patches()
+    {
+        bool success = true;
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
+        {
+            tracked_patch& patch = tracked_patches[ i ];
+            if ( !patch.active )
+                continue;
+
+            uint64_t current = 0;
+            if ( !patch_read( patch.target, patch.width, current ) )
+            {
+                success = false;
+                continue;
+            }
+
+            if ( current == patch.replacement )
+            {
+                if ( !patch_write( patch.target, patch.width, patch.original ) )
+                    success = false;
+            }
+            else
+            {
+                InterlockedIncrement64( &patch_conflicts );
+            }
+            patch.active = false;
+        }
+        KeReleaseSpinLock( &cb_registry_lock, old );
+        return success;
+    }
+
     // - Lifecycle -
     //
 
     void init()
     {
         KeInitializeSpinLock( &cb_registry_lock );
+        if ( callback_rundown_initialized )
+            ExReInitializeRundownProtection( &callback_rundown );
+        else
+        {
+            ExInitializeRundownProtection( &callback_rundown );
+            callback_rundown_initialized = true;
+        }
+        accepting_teardown = true;
+
+        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+            teardown_refs[ i ] = LUA_NOREF;
+        patch_conflicts = 0;
+        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
+            tracked_patches[ i ] = {};
 
         for ( int i = 0; i < MAX_EVENTS; i++ )
         {
             cb_registry[ i ].lua_ref            = LUA_NOREF;
             cb_registry[ i ].arg_count          = 0;
             cb_registry[ i ].active             = false;
+            cb_registry[ i ].nonblocking        = false;
             cb_registry[ i ].fallback_address   = nullptr;
             cb_registry[ i ].fallback_ret_width = 8;
             cb_registry[ i ].fallback_value     = 0;
+            cb_registry[ i ].wait_ms            = 0;
+            cb_registry[ i ].lock_misses        = 0;
+            cb_registry[ i ].gate_len           = 0;
+            cb_registry[ i ].gate_seq           = 0;
             cb_trampoline_table[ i ]            = nullptr;
         }
 
@@ -429,16 +560,11 @@ namespace callback
         #undef TRAMP
     }
 
-    void destroy()
+    void begin_teardown()
     {
-        // Mark all slots inactive. Trampolines become no-ops (dispatch checks
-        // active inside LL, which unload_driver holds before lua::destroy).
-        // lua_close(L) will free all registry refs automatically. Fallbacks
-        // are cleared too so a straggler trampoline can't invoke a stale
-        // native pointer during unload.
-        //
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
+        accepting_teardown = false;
         for ( int i = 0; i < MAX_EVENTS; i++ )
         {
             cb_registry[ i ].active             = false;
@@ -450,6 +576,70 @@ namespace callback
             InterlockedIncrement64( &cb_registry[ i ].gate_seq );
         }
         KeReleaseSpinLock( &cb_registry_lock, old );
+
+        ExRundownCompleted( &callback_rundown );
+        ExWaitForRundownProtectionRelease( &callback_rundown );
+    }
+
+    void run_teardown( lua_State* Ls )
+    {
+        int base = lua_gettop( Ls );
+        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+        {
+            if ( teardown_refs[ i ] == LUA_NOREF )
+                continue;
+
+            lua_rawgeti( Ls, LUA_REGISTRYINDEX, teardown_refs[ i ] );
+            if ( lua_pcall( Ls, 0, 0, 0 ) )
+            {
+                const char* message = lua_tostring( Ls, -1 );
+                logger::error( "teardown %d: %s\n", i, message ? message : "(non-string error object)" );
+            }
+            lua_settop( Ls, base );
+        }
+    }
+
+    void destroy( lua_State* Ls )
+    {
+        int refs[ callback::MAX_EVENTS ];
+        int cleanup_refs[ MAX_TEARDOWN_CALLBACKS ];
+
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+        for ( int i = 0; i < MAX_EVENTS; i++ )
+        {
+            refs[ i ] = cb_registry[ i ].lua_ref;
+            cb_registry[ i ].lua_ref            = LUA_NOREF;
+            cb_registry[ i ].active             = false;
+            cb_registry[ i ].arg_count          = 0;
+            cb_registry[ i ].nonblocking        = false;
+            cb_registry[ i ].fallback_address   = nullptr;
+            cb_registry[ i ].fallback_ret_width = 8;
+            cb_registry[ i ].fallback_value     = 0;
+            cb_registry[ i ].wait_ms            = 0;
+            cb_registry[ i ].lock_misses        = 0;
+            cb_registry[ i ].gate_len           = 0;
+        }
+        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+        {
+            cleanup_refs[ i ] = teardown_refs[ i ];
+            teardown_refs[ i ] = LUA_NOREF;
+        }
+        KeReleaseSpinLock( &cb_registry_lock, old );
+
+        for ( int i = 0; i < callback::MAX_EVENTS; i++ )
+        {
+            if ( refs[ i ] != LUA_NOREF )
+                luaL_unref( Ls, LUA_REGISTRYINDEX, refs[ i ] );
+        }
+        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+        {
+            if ( cleanup_refs[ i ] != LUA_NOREF )
+                luaL_unref( Ls, LUA_REGISTRYINDEX, cleanup_refs[ i ] );
+        }
+
+        if ( !restore_all_patches() )
+            logger::error( "tracked patch restoration fault\n" );
     }
 
     void* get_trampoline( int event_id )
@@ -496,10 +686,13 @@ namespace callback
     static int set_handler( lua_State* Ls )
     {
         int event_id  = (int) luaL_checkunsigned( Ls, 1 );
-        int arg_count = (int) luaL_checkunsigned( Ls, 2 );
+        uint64_t arg_count_value = luaL_checkunsigned( Ls, 2 );
+        int arg_count = ( int ) arg_count_value;
 
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return luaL_error( Ls, "invalid event_id %d", event_id );
+        if ( arg_count_value > 16 )
+            return luaL_error( Ls, "arg_count must be between 0 and 16" );
 
         // Push the Lua function (arg 3) and ref it in the registry.
         // Done at PASSIVE_LEVEL (called from REPL via IOCTL, LL is held).
@@ -590,6 +783,9 @@ namespace callback
             address = ( const void* ) lua_tounsigned( Ls, 2 );
         }
 
+        if ( address && ( uint64_t ) address < 0xFFFF800000000000ull )
+            return luaL_error( Ls, "fallback address is not a canonical kernel address" );
+
         if ( !lua_isnoneornil( Ls, 3 ) )
         {
             int w = (int) luaL_checkunsigned( Ls, 3 );
@@ -637,6 +833,143 @@ namespace callback
         KeReleaseSpinLock( &cb_registry_lock, old );
 
         return 0;
+    }
+
+    static int on_teardown( lua_State* Ls )
+    {
+        luaL_checktype( Ls, 1, LUA_TFUNCTION );
+        lua_pushvalue( Ls, 1 );
+        int ref = luaL_ref( Ls, LUA_REGISTRYINDEX );
+        int slot = -1;
+
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+        if ( accepting_teardown )
+        {
+            for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+            {
+                if ( teardown_refs[ i ] == LUA_NOREF )
+                {
+                    teardown_refs[ i ] = ref;
+                    slot = i;
+                    break;
+                }
+            }
+        }
+        KeReleaseSpinLock( &cb_registry_lock, old );
+
+        if ( slot < 0 )
+        {
+            luaL_unref( Ls, LUA_REGISTRYINDEX, ref );
+            lua_pushboolean( Ls, 0 );
+            return 1;
+        }
+
+        lua_pushboolean( Ls, 1 );
+        return 1;
+    }
+
+    static int track_patch( lua_State* Ls )
+    {
+        uint64_t target = luaL_checkunsigned( Ls, 1 );
+        uint64_t replacement = luaL_checkunsigned( Ls, 2 );
+        uint8_t width = 8;
+        if ( !lua_isnoneornil( Ls, 3 ) )
+        {
+            uint64_t value = luaL_checkunsigned( Ls, 3 );
+            if ( value != 1 && value != 2 && value != 4 && value != 8 )
+                return luaL_error( Ls, "patch width must be 1, 2, 4 or 8" );
+            width = ( uint8_t ) value;
+        }
+        if ( target < 0xFFFF800000000000ull )
+            return luaL_error( Ls, "patch target is not a canonical kernel address" );
+
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+
+        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
+        {
+            const tracked_patch& patch = tracked_patches[ i ];
+            if ( patch.active && patch.target == target &&
+                 patch.replacement == replacement && patch.width == width )
+            {
+                KeReleaseSpinLock( &cb_registry_lock, old );
+                lua_pushunsigned( Ls, i );
+                return 1;
+            }
+            if ( patch.active && patch.target == target )
+            {
+                KeReleaseSpinLock( &cb_registry_lock, old );
+                return luaL_error( Ls, "patch target already tracked" );
+            }
+        }
+
+        int slot = -1;
+        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
+        {
+            if ( !tracked_patches[ i ].active )
+            {
+                slot = i;
+                break;
+            }
+        }
+        if ( slot < 0 )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return luaL_error( Ls, "tracked patch table is full" );
+        }
+
+        uint64_t original = 0;
+        if ( !patch_read( target, width, original ) ||
+             !patch_write( target, width, replacement ) )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return luaL_error( Ls, "could not read or write patch target" );
+        }
+
+        tracked_patches[ slot ] = { target, original, replacement, width, true };
+        KeReleaseSpinLock( &cb_registry_lock, old );
+        lua_pushunsigned( Ls, slot );
+        return 1;
+    }
+
+    static int restore_patch( lua_State* Ls )
+    {
+        uint64_t id = luaL_checkunsigned( Ls, 1 );
+        if ( id >= MAX_TRACKED_PATCHES )
+            return luaL_error( Ls, "invalid patch id" );
+
+        bool restored = false;
+        KIRQL old;
+        KeAcquireSpinLock( &cb_registry_lock, &old );
+        tracked_patch& patch = tracked_patches[ id ];
+        if ( patch.active )
+        {
+            uint64_t current = 0;
+            if ( patch_read( patch.target, patch.width, current ) )
+            {
+                if ( current == patch.replacement )
+                    restored = patch_write( patch.target, patch.width, patch.original );
+                else
+                    InterlockedIncrement64( &patch_conflicts );
+                patch.active = false;
+            }
+        }
+        KeReleaseSpinLock( &cb_registry_lock, old );
+        lua_pushboolean( Ls, restored );
+        return 1;
+    }
+
+    static int restore_all_patches_lua( lua_State* Ls )
+    {
+        lua_pushboolean( Ls, restore_all_patches() );
+        return 1;
+    }
+
+    static int patch_conflicts_lua( lua_State* Ls )
+    {
+        lua_pushinteger( Ls, patch_conflicts );
+        return 1;
     }
 
     // SetGate(eid, program | nil)
@@ -693,7 +1026,7 @@ namespace callback
                 return luaL_error( Ls, "gate instruction %d: arg index out of range", ( int ) i );
             if ( unit == 1 && index > 0xFFF )
                 return luaL_error( Ls, "gate instruction %d: stack offset out of range", ( int ) i );
-            if ( unit == 2 && index > 0x400 )
+            if ( unit == 2 && index > 0x500 )
                 return luaL_error( Ls, "gate instruction %d: thread offset out of range", ( int ) i );
         }
 
@@ -784,5 +1117,20 @@ namespace callback
 
         lua_pushunsigned( Ls, PASS_THROUGH_SENTINEL );
         lua_setglobal( Ls, "PASS_THROUGH" );
+
+        lua_pushcfunction( Ls, &on_teardown );
+        lua_setglobal( Ls, "OnTeardown" );
+
+        lua_pushcfunction( Ls, &track_patch );
+        lua_setglobal( Ls, "TrackPatch" );
+
+        lua_pushcfunction( Ls, &restore_patch );
+        lua_setglobal( Ls, "RestorePatch" );
+
+        lua_pushcfunction( Ls, &restore_all_patches_lua );
+        lua_setglobal( Ls, "RestoreAllPatches" );
+
+        lua_pushcfunction( Ls, &patch_conflicts_lua );
+        lua_setglobal( Ls, "PatchConflicts" );
     }
 }
