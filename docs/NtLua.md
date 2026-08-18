@@ -131,6 +131,12 @@ completes the IRP.
 The console's `print()` output is captured in the output buffer. Runtime and
 parser failures are captured in the error buffer.
 
+`print` is the standard Lua base-library function. Its stdout writes are
+intercepted by the driver's custom CRT: `fwrite` appends to `logger::logs`
+(output buffer) for stdout and to `logger::errors` (error buffer) for stderr.
+Both buffers are reset at the start of every run, so output from a previous
+execution is not carried into the next.
+
 ### `NTLUA_RESET`
 
 Reset performs an ordered VM reset:
@@ -421,12 +427,26 @@ KernelLuaVm/runtime/struct.lua
 KernelLuaVm/runtime/gate.lua
 ```
 
+### Raw allocation: `malloc` / `free`
+
+```lua
+local pointer = malloc(size)
+free(pointer)
+```
+
+`malloc` allocates a nonpaged kernel buffer through
+`ExAllocatePoolWithTag` and returns its address. `free` releases it through
+`ExFreePoolWithTag`. These do not install a Lua finalizer; the caller owns the
+lifetime. Prefer `tmp` for scoped buffers and only reach for `malloc`/`free`
+when the buffer must outlive a single Lua value or is handed to native code.
+
 ### Temporary buffers: `tmp`
 
 ```lua
 local buffer = tmp(size)
 local address = buffer:ref()
 local value = buffer:get([offset])
+buffer:set(value [, offset])
 ```
 
 `tmp` allocates from nonpaged pool and installs a Lua `__gc` finalizer that
@@ -489,6 +509,17 @@ end
 The snapshot keeps the backing Lua string, target process, and target address
 so `:write()` can copy the modified buffer back.
 
+### Raw byte helpers: `struct.read_bytes` / `struct.write_bytes`
+
+```lua
+local bytes = struct.read_bytes(address, count)   -- -> Lua string
+struct.write_bytes(address, lua_string)           -- write each byte
+```
+
+`struct.read_bytes` reads `count` consecutive bytes into a Lua string.
+`struct.write_bytes` writes the bytes of a Lua string into memory. These are
+the primitives used for fields wider than 8 bytes.
+
 ### Admission gates: `gate.compile`
 
 `gate.compile` turns readable Lua policy into a fixed-width instruction stream
@@ -512,6 +543,33 @@ Conditions in one row are ANDed. Rows are ORed. Selectors are:
 Operators are `eq`, `ne`, `lt`, `gt`, `le`, `ge`, `range`, `anybits`, and
 `allbits`. An optional `mask` is applied before comparison. Programs are
 limited to 32 five-word instructions.
+
+### Installing and clearing a gate: `SetGate`
+
+`SetGate` installs a compiled admission program on a callback event, or clears
+it:
+
+```lua
+SetGate(eid, gate.compile{ { { arg = 0, eq = 123 } } })
+SetGate(eid)           -- clear the gate (event returns to ungated dispatch)
+SetGate(eid, nil)      -- same as above
+```
+
+The program is validated in full before it is installed; a rejected program
+changes nothing and raises a Lua error. The driver evaluates the gate on every
+event before any lock or Lua dispatch:
+
+- **No gate installed** — the event follows its normal blocking or nonblocking
+  dispatch path.
+- **Gate rejects the event** — the fallback runs immediately with no VM lock
+  traffic (this is how hot syscall-rate hooks stay cheap).
+- **Gate accepts the event** — the dispatch waits for `LL` up to its configured
+  `SetWait` bound (gated default 250 ms) and then runs the Lua handler
+  synchronously.
+
+A gate program is tied to one event and is cleared by `FreeEvent`, RESET, or
+driver unload. The program lives entirely as data interpreted by signed driver
+code; the driver never learns what the compared values mean.
 
 ## Callback Bridge
 
@@ -626,8 +684,19 @@ Registers `PsSetCreateProcessNotifyRoutine`, records process creation and exit
 events, resolves image names, and exposes:
 
 ```lua
-StopProcessMonitor()
+StopProcessMonitor()          -- deregister + free the event, idempotent
+worker()                      -- drains buffered events to console output
 ```
+
+Exposed state:
+
+```lua
+callback_count                -- cumulative callback invocations
+```
+
+`callback_count` counts every process-notify invocation (both create and
+exit). Creation/exit text is buffered in an internal `events` table and
+printed by `worker()`, which the console calls periodically.
 
 It registers `OnTeardown` and makes cleanup idempotent. The callback is
 deregistered and its event freed automatically during reset/unload.
@@ -637,30 +706,89 @@ deregistered and its event freed automatically during reset/unload.
 Enumerates eight callback families using pattern scanning and structure
 walking:
 
-- Process
-- Thread
-- ImageLoad
-- Registry
-- Object process
-- Object thread
-- Object desktop
-- Driver verification
+- `LoadImage`
+- `Process`
+- `Thread`
+- `ProcessObject`
+- `ThreadObject`
+- `DesktopObject`
+- `Registry`
+- `DriverVerification`
 
-Important script APIs:
+Results are stored keyed by type in the global `callbacks` table; each value
+is an array of entry objects:
 
 ```lua
-print_callbacks()
-filter_callbacks(predicate)
-remove_callback(entry)
-restore_callback(entry)
-remove_all([driver_substring])
-restore_all()
-hook_callback(entry, lua_handler [, argc])
+callbacks.LoadImage[1]        -- one entry
+callbacks.Process[2]
 ```
 
-The script detects process Ex/Ex2 callback versions from callback-block flags,
-tracks removals, supports trampoline replacement, and includes a WdFilter Ex2
-process-notify demonstration that denies `notepad.exe`.
+### Entry object shape
+
+Each entry carries the fields needed to inspect, remove, or hook a callback:
+
+| Field       | Meaning |
+|-------------|---------|
+| `address`   | The callback function address |
+| `entry`     | Array slot or list-node address (used by remove/restore) |
+| `fn_addr`   | Address of the writable function pointer |
+| `argc`      | Argument count for the trampoline |
+| `ret_width` | Expected return width in bytes (1, 4, or 8) |
+| `type`      | The callback family key (e.g. `"Process"`) |
+| `version`   | Process/LoadImage: `""`, `"Ex"`, or `"Ex2"` |
+| `post`      | Object callbacks only: `true` = PostOperation, `false` = PreOperation |
+| `driver`    | Owning driver name (`"unknown"` when unresolvable) |
+| `base`      | Owning driver image base |
+| `offset`    | Function address minus driver base |
+
+Entries are populated by `enumerate_callbacks()`, which must run before the
+`callbacks` table is useful.
+
+### Query and display
+
+```lua
+enumerate_callbacks()                 -- repopulate callbacks (all families)
+print_callbacks()                     -- print grouped by type
+filter_callbacks(pred)                -- flat list of entries where pred(e)
+```
+
+`filter_callbacks` runs `pred(entry)` across every entry of every family and
+returns a flat array of matches.
+
+### Removal and restoration
+
+Removal strategies differ by family (array slot zeroing vs. list unlink), but
+the API is uniform. State is recorded so removals can be reversed:
+
+```lua
+remove_callback(entry)                -- remove one; returns boolean
+restore_callback(entry)               -- undo one removal
+remove_all([driver_substring])        -- remove all, or all owned by driver
+restore_all()                         -- undo every recorded removal
+removed                               -- array of currently-removed entries
+```
+
+### Hooking
+
+```lua
+hook_callback(entry, lua_handler [, argc])
+unhook_callback(entry)                -- restore original pointer + free event
+unhook_all()                          -- unhook every hooked entry
+hooked                                -- array of currently-hooked entries
+```
+
+`hook_callback` replaces the callback function pointer with a bridge
+trampoline that dispatches to `lua_handler`. The handler receives `argc`
+callback arguments followed by the three trap-time context values. The
+fallback is the original function, and the pointer change is tracked with
+`TrackPatch` so it is restored automatically during reset/unload.
+
+### Demonstration
+
+The script detects process Ex/Ex2 callback versions from callback-block flags
+and includes a WdFilter Ex2 process-notify demonstration that denies
+`notepad.exe`. Buffered events are drained by `worker()`; `proc_events` is the
+internal event buffer the demonstration fills.
 
 It registers `OnTeardown` to unhook and restore removed callbacks.
 
@@ -681,6 +809,40 @@ Implements the InfinityHookPro-style path:
 The demo hooks `NtCreateFile`, `NtOpenFile`, and `NtTraceControl`. Allow paths
 return `PASS_THROUGH`, so the original syscall runs without holding the VM
 lock. `UnhookAll()` restores tracked patches and callback events.
+
+### Exposed functions and state
+
+```lua
+HookSyscall(name, fn)        -- resolve an SSDT service and hook it
+UnhookAll()                  -- restore tracked patches + free events
+worker()                     -- print stats/walk diagnostics + self-heal
+```
+
+### Diagnostic globals
+
+```lua
+stats_gc               -- gate-matched timestamp handlers that ran
+stats_create_file      -- NtCreateFile hook invocations
+stats_open_file        -- NtOpenFile hook invocations
+stats_trace_control    -- NtTraceControl hook invocations
+```
+
+Walk-pipeline counters (all reset to zero at load):
+
+```lua
+dbg_gc_indexed     -- timestamp whose CallIndex matched a hooked syscall
+dbg_gc_walked      -- entered the stack walk
+dbg_magic_dword    -- syscall-entry magic (0x501802/0x601802) seen
+dbg_magic_f33      -- entry frame marker (0xF33) seen
+dbg_magic_f34      -- exit frame marker (0xF34) seen
+dbg_gc_cand        -- return-address candidate on the syscall page
+dbg_gc_swap        -- function slot swapped to the trampoline
+dbg_gc_already     -- slot already held the trampoline
+dbg_gc_miss        -- slot held neither the original nor the trampoline
+dbg_miss_val       -- last mismatched slot value
+dbg_miss_orig      -- ... compared against the expected original
+dbg_last_idx       -- last syscall index that triggered a walk
+```
 
 The script exposes runtime diagnostics through `worker()`, including gate
 matches, walk statistics, and `EventMisses` counts. It registers `OnTeardown`
