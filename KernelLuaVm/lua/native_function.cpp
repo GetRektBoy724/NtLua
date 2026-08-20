@@ -72,7 +72,7 @@ int native_function::invoke( lua_State* L )
     //
     int n = lua_gettop( L ) - 1;
     if ( n >= 32 )
-        luaL_error( L, "Too many arguments provided %d vs maximum of 16\n", n );
+        luaL_error( L, "Too many arguments provided %d vs maximum of 31\n", n );
 
     // Recursively create the call frame and call out.
     //

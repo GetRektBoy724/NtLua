@@ -1,4 +1,5 @@
 #include "state.hpp"
+#include "../trace_ring.hpp"
 
 namespace lua
 {
@@ -28,9 +29,16 @@ namespace lua
         //
         if ( !odata )
         {
-            // Simply allocate as requested and return.
+            // Allocate as requested. The header size MUST be written on the
+            // first allocation too - lua_realloc later compares against it;
+            // leaving it as uninitialized pool garbage handed Lua a block
+            // that could be smaller than the size it reported.
             //
-            return ( ( allocation_header* ) malloc( nsize + sizeof( allocation_header ) ) )->data();
+            allocation_header* nhdr = ( allocation_header* ) malloc( nsize + sizeof( allocation_header ) );
+            if ( !nhdr )
+                return nullptr;
+            nhdr->size = nsize;
+            return nhdr->data();
         }
 
         // Resolve allocation header of the old data.
@@ -46,9 +54,13 @@ namespace lua
         //
         nsize = max( min( pow( nsize, 1.2 ), PAGE_SIZE ), nsize );
 
-        // Allocate from non-paged pool and write the size.
+        // Allocate from non-paged pool and write the size. A failed realloc
+        // returns NULL without touching the old block - that is the lua_Alloc
+        // contract, and Lua turns it into a clean out-of-memory error.
         //
         allocation_header* nhdr = ( allocation_header* ) malloc( nsize + sizeof( allocation_header ) );
+        if ( !nhdr )
+            return nullptr;
         nhdr->size = nsize;
 
         // Relocate the old data and free.
@@ -72,6 +84,20 @@ namespace lua
         return 0;
     }
 
+    // Count hook installed on every VM: once the per-work-unit instruction
+    // budget drains, raises a Lua error. Caught by the enclosing lua_pcall
+    // (chunks in execute, handlers in run_handler) with a traceback, so an
+    // infinite loop aborts cleanly instead of pinning the VM lock.
+    //
+    static void execution_hook( lua_State* L, lua_Debug* )
+    {
+        lua_context* context = get_context( L );
+        context->budget_remaining -= lua_context::EXECUTION_HOOK_STEP;
+        if ( context->budget_remaining <= 0 )
+            luaL_error( L, "script exceeded the instruction budget (%lld instructions)",
+                        ( long long ) lua_context::EXECUTION_BUDGET );
+    }
+
     // Initializes a Lua state.
     //
     lua_State* init()
@@ -80,6 +106,7 @@ namespace lua
         if ( !L ) return nullptr;
         lua_atpanic( L, &panic );
         luaL_openlibs( L );
+        lua_sethook( L, &execution_hook, LUA_MASKCOUNT, lua_context::EXECUTION_HOOK_STEP );
         return L;
     }
 
@@ -132,6 +159,7 @@ namespace lua
         //
         int entry = lua_gettop( L );
         lua_context* context = lua::get_context( L );
+        context->budget_remaining = lua_context::EXECUTION_BUDGET;
         context->panic_owner = ( void* ) KeGetCurrentThread();
         context->panic_active = 1;
 
@@ -143,7 +171,9 @@ namespace lua
             //
             if ( luaL_loadbuffer( L, code, len, chunkname ) )
             {
-                logger::error( "Lua parser error: %s\n", lua_tostring( L, -1 ) );
+                const char* msg = lua_tostring( L, -1 );
+                trace::push( NTLUA_TRK_TRAP, msg ? msg : "parser error", 0, nullptr, 0 );
+                logger::error( "Lua parser error: %s\n", msg ? msg : "(non-string error object)" );
                 lua_pop( L, 1 );
                 context->panic_active = 0;
                 context->panic_owner = nullptr;
@@ -160,35 +190,46 @@ namespace lua
                 lua_pushcfunction( L, &traceback );
                 lua_insert( L, base );        // move handler under the chunk
 
+                trace::push( NTLUA_TRK_CALL, chunkname, 0, nullptr, 0 );
+
                 int status = lua_pcall( L, 0, user_input ? LUA_MULTRET : 0, base );
                 lua_remove( L, base );        // drop the handler
 
                 if ( status )
                 {
-                    logger::error( "Lua runtime error: %s\n", lua_tostring( L, -1 ) );
+                    const char* msg = lua_tostring( L, -1 );
+                    trace::push( NTLUA_TRK_TRAP, msg ? msg : "runtime error", 0, nullptr, 0 );
+                    logger::error( "Lua runtime error: %s\n", msg ? msg : "(non-string error object)" );
                     lua_pop( L, 1 );
                 }
                 // If not internal and we have something left on stack:
                 //
-                else if ( user_input && lua_gettop( L ) > entry )
+                else
                 {
-                    // Redirect to print.
-                    //
-                    lua_getglobal( L, "print" );
-                    lua_insert( L, entry + 1 );
-                    lua_pcall( L, lua_gettop( L ) - ( entry + 1 ), 0, 0 );
+                    trace::push( NTLUA_TRK_RETURN, chunkname, 0, nullptr, 0 );
+                    if ( user_input && lua_gettop( L ) > entry )
+                    {
+                        // Redirect to print.
+                        //
+                        lua_getglobal( L, "print" );
+                        lua_insert( L, entry + 1 );
+                        lua_pcall( L, lua_gettop( L ) - ( entry + 1 ), 0, 0 );
+                    }
                 }
 
                 lua_settop( L, entry );
             }
             __except ( 1 )
             {
+                uint64_t a[ 1 ] = { ( uint64_t ) GetExceptionCode() };
+                trace::push( NTLUA_TRK_TRAP, "SEH", 1, a, 0 );
                 logger::error( "Lua SEH error: %x\n", GetExceptionCode() );
                 lua_settop( L, entry );
             }
         }
         else
         {
+            trace::push( NTLUA_TRK_TRAP, "panic", 0, nullptr, 0 );
             logger::error( "Lua Panic!" );
         }
 

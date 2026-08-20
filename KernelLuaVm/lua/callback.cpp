@@ -1,5 +1,6 @@
 #include "callback.hpp"
 #include "../logger.hpp"
+#include "../trace_ring.hpp"
 #include "native_function.hpp"
 
 // - Admission gate ISA -
@@ -288,8 +289,29 @@ static uint64_t run_handler( int event_id, const uint64_t args[16], uint64_t thr
          cb_registry[ event_id ].lua_ref == LUA_NOREF )
         return 0;
 
+    // Fresh instruction budget for this handler (see lua_context).
+    //
+    lua::get_context( L )->budget_remaining = lua::lua_context::EXECUTION_BUDGET;
+
     int base = lua_gettop( L );
     uint64_t result = 0;
+
+    // Trace handler execution when enabled: name + captured args up front,
+    // RETURN with the result on success, TRAP on Lua error or SEH (which
+    // route to the fallback below via PASS_THROUGH_SENTINEL).
+    //
+    char     event_name[ 16 ] = {};
+    uint64_t targv[ 4 ] = {};
+    uint32_t targc = 0;
+    bool     tracing = trace::enabled();
+    if ( tracing )
+    {
+        sprintf_s( event_name, sizeof( event_name ), "cb %d", event_id );
+        targc = cb_registry[ event_id ].arg_count;
+        if ( targc > 4 ) targc = 4;
+        for ( uint32_t i = 0; i < targc; i++ )
+            targv[ i ] = args[ i ];
+    }
 
     __try
     {
@@ -311,27 +333,47 @@ static uint64_t run_handler( int event_id, const uint64_t args[16], uint64_t thr
         lua_pushunsigned( L, stack_base );
         lua_pushunsigned( L, rsp );
 
+        if ( tracing )
+            trace::push( NTLUA_TRK_CALL, event_name, targc, targv, 0 );
+
         // Call Lua with arg_count args plus the three context values
         // (handlers that don't declare them simply drop the extras).
-        // On error: log and return 0 (allow). On success: read the
-        // return value (0=allow, NTSTATUS=deny/modify).
+        // On error or SEH: route to the configured native fallback so the
+        // system behaves as if the hook had not fired (without a fallback,
+        // invoke_fallback returns fallback_value, i.e. 0). On success: read
+        // the return value (0=allow, NTSTATUS=deny/modify).
         //
         if ( lua_pcall( L, nargs + 3, 1, 0 ) )
         {
             const char* msg = lua_tostring( L, -1 );
+            if ( tracing )
+                trace::push( NTLUA_TRK_TRAP, msg ? msg : "callback error", 0, nullptr, 0 );
             logger::error( "callback %d: %s\n", event_id, msg ? msg : "(non-string error object)" );
             lua_settop( L, base );
+            // A broken handler must not silently read as "allow" (0) on hooks
+            // where zero is meaningful. Route to the configured native
+            // fallback so the system behaves as if the hook had not fired;
+            // without a fallback, invoke_fallback returns fallback_value,
+            // preserving the previous behavior.
+            //
+            result = PASS_THROUGH_SENTINEL;
         }
         else
         {
             result = lua_tounsigned( L, -1 );
             lua_settop( L, base );
+            if ( tracing )
+                trace::push( NTLUA_TRK_RETURN, event_name, 0, nullptr, result );
         }
     }
     __except ( 1 )
     {
+        uint64_t a[ 1 ] = { ( uint64_t ) GetExceptionCode() };
+        if ( tracing )
+            trace::push( NTLUA_TRK_TRAP, "SEH", 1, a, 0 );
         logger::error( "callback %d SEH: %x\n", event_id, GetExceptionCode() );
         lua_settop( L, base );
+        result = PASS_THROUGH_SENTINEL;
     }
 
     return result;
@@ -386,7 +428,16 @@ namespace callback
         // us are untouched. Run the handler inline.
         //
         if ( LL.owned_by_current() )
-            return run_handler( event_id, args, thread, stack_base, rsp );
+        {
+            uint64_t result = run_handler( event_id, args, thread, stack_base, rsp );
+            // Same conversion as the main path below: a handler asking to
+            // pass through must reach the native fallback, not leak the
+            // sentinel value to the kernel caller.
+            //
+            if ( result == PASS_THROUGH_SENTINEL )
+                return invoke_fallback( fb_addr, fb_width, fb_argc, fb_value, args );
+            return result;
+        }
 
         // A gate match waits for LL (never misses merely because the VM is
         // busy) but never unbounded: matches on syscall-rate hooks can

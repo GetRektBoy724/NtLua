@@ -2,6 +2,8 @@
 #include <ntifs.h>
 #include <intrin.h>
 #include "logger.hpp"
+#include "trace_ring.hpp"
+#include "log_ring.hpp"
 #include "lua/state.hpp"
 #include "lua/native_function.hpp"
 #include "driver_io.hpp"
@@ -105,6 +107,101 @@ namespace lua
     }
 };
 
+// Bounded wait for a NTLUA_RUN chunk. A script wedged inside a blocking
+// native FFI call can never be preempted (the instruction hook only fires
+// between Lua instructions), so the IRP gives up after this long; the
+// execution thread keeps running in the background and aborts via the
+// instruction budget the moment control returns to Lua.
+//
+static constexpr LONGLONG NTLUA_RUN_TIMEOUT_MS = 30000;
+
+struct captured_buffer
+{
+    char*  data   = nullptr;
+    size_t length = 0;
+};
+
+// One NTLUA_RUN request. Allocated as a single pool block with the code and
+// chunk name appended; owned by the execution thread, which frees it after
+// the caller has either consumed the results or given up (abort).
+//
+struct execution_request
+{
+    char* code;                       // points into this allocation
+    char* chunkname;                  // points into this allocation
+    captured_buffer errors_copy;      // filled by the execution thread
+    captured_buffer outputs_copy;
+    KEVENT done_event;                // execution thread finished
+    KEVENT consumed_event;            // caller exported the buffers
+    KEVENT abort_event;               // caller timed out / gave up
+};
+
+// Executes one chunk on its own system thread so the NTLUA_RUN IOCTL can
+// bound the wait. Runs under LL exactly like the old inline path, then hands
+// the captured output to the caller and only frees the request once the
+// caller has consumed it or signalled abort.
+//
+static VOID NTAPI vm_execution_worker( PVOID start_context )
+{
+    execution_request* req = ( execution_request* ) start_context;
+
+    {
+        unique_lock _g{ LL };
+
+        // Queued behind a wedged chunk and the caller gave up meanwhile - do
+        // no work, just free the request.
+        //
+        if ( !KeReadStateEvent( &req->abort_event ) )
+        {
+            lua::begin_ctx();
+            lua::execute( L, req->code, true, req->chunkname );
+            lua::end_ctx();
+
+            // Capture only the output produced since the last capture
+            // (watermark), so print() from callbacks that fire between
+            // chunks is preserved instead of wiped by the next chunk.
+            //
+            const auto capture = [ ] ( logger::string_buffer& buf ) -> captured_buffer
+            {
+                captured_buffer out;
+                size_t avail = buf.iterator - buf.read_pos;
+                if ( avail )
+                {
+                    out.data = ( char* ) malloc( avail + 1 );
+                    if ( out.data )
+                    {
+                        out.length = buf.capture_delta( out.data, avail );
+                        out.data[ out.length ] = 0;
+                    }
+                }
+                return out;
+            };
+
+            if ( logger::global )
+            {
+                req->errors_copy  = capture( logger::global->errors );
+                req->outputs_copy = capture( logger::global->logs );
+            }
+
+            // Flush any trailing partial line (print() without a newline) so
+            // it still shows up in the tail log ring.
+            //
+            log_ring::flush_partial();
+        }
+    }
+
+    // Release LL before waiting: the user-mode export below must not happen
+    // under the VM lock.
+    //
+    KeSetEvent( &req->done_event, IO_NO_INCREMENT, FALSE );
+
+    PVOID handoff[ 2 ] = { &req->consumed_event, &req->abort_event };
+    KeWaitForMultipleObjects( 2, handoff, WaitAny, Executive, KernelMode, FALSE, nullptr, nullptr );
+
+    free( req );
+    PsTerminateSystemThread( STATUS_SUCCESS );
+}
+
 // Device control handler.
 //
 NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
@@ -187,52 +284,65 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
                 code = input + name_len + 1;
             }
 
-            struct captured_buffer
-            {
-                char*  data   = nullptr;
-                size_t length = 0;
-            };
-
-            captured_buffer errors_copy, outputs_copy;
-
-            // Snapshot the output under the VM lock, but keep the lock scope
-            // as small as possible: exporting into user mode (below) does a
-            // ZwAllocateVirtualMemory plus a copy, which must NOT hold LL -
-            // otherwise every syscall callback that fires during that copy
-            // misses the nonblocking gate.
+            // Copy the input into the request before spawning the thread: the
+            // worker outlives this IRP on the timeout path and must never
+            // touch SystemBuffer again once the IRP has completed.
             //
+            size_t code_len = strlen( code );
+            size_t name_len_out = strlen( chunkname );
+            execution_request* req = ( execution_request* ) malloc(
+                sizeof( execution_request ) + code_len + 1 + name_len_out + 1 );
+            if ( !req )
             {
-                unique_lock _g{ LL };
+                irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+                irp->IoStatus.Information = 0;
+                IoReleaseRemoveLock( &remove_lock, irp );
+                IoCompleteRequest( irp, IO_NO_INCREMENT );
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            req->code = ( char* ) ( req + 1 );
+            req->chunkname = req->code + code_len + 1;
+            memcpy( req->code, code, code_len + 1 );
+            memcpy( req->chunkname, chunkname, name_len_out + 1 );
+            KeInitializeEvent( &req->done_event, NotificationEvent, FALSE );
+            KeInitializeEvent( &req->consumed_event, NotificationEvent, FALSE );
+            KeInitializeEvent( &req->abort_event, NotificationEvent, FALSE );
 
-                logger::errors.reset();
-                logger::logs.reset();
+            HANDLE thread_handle = nullptr;
+            NTSTATUS create_status = PsCreateSystemThread(
+                &thread_handle, 0, nullptr, nullptr, nullptr, &vm_execution_worker, req );
+            if ( !NT_SUCCESS( create_status ) )
+            {
+                free( req );
+                irp->IoStatus.Status = create_status;
+                irp->IoStatus.Information = 0;
+                IoReleaseRemoveLock( &remove_lock, irp );
+                IoCompleteRequest( irp, IO_NO_INCREMENT );
+                return create_status;
+            }
+            if ( thread_handle ) ZwClose( thread_handle );
 
-                lua::begin_ctx();
-                lua::execute( L, code, true, chunkname );
-                lua::end_ctx();
+            // Bound the wait. On timeout the IRP completes while the worker
+            // keeps running in the background; abort tells it to free its
+            // request without touching this IRP.
+            //
+            LARGE_INTEGER timeout;
+            timeout.QuadPart = -10000 * NTLUA_RUN_TIMEOUT_MS;
+            NTSTATUS wait_status = KeWaitForSingleObject(
+                &req->done_event, Executive, KernelMode, FALSE, &timeout );
 
-                const auto capture = [ ] ( logger::string_buffer& buf ) -> captured_buffer
-                {
-                    captured_buffer out;
-                    if ( buf.iterator )
-                    {
-                        out.data = ( char* ) malloc( buf.iterator + 1 );
-                        if ( out.data )
-                        {
-                            memcpy( out.data, buf.raw, buf.iterator );
-                            out.data[ buf.iterator ] = 0;
-                            out.length = buf.iterator;
-                        }
-                    }
-                    buf.reset();
-                    return out;
-                };
-
-                errors_copy  = capture( logger::errors );
-                outputs_copy = capture( logger::logs );
+            if ( wait_status == STATUS_TIMEOUT )
+            {
+                KeSetEvent( &req->abort_event, IO_NO_INCREMENT, FALSE );
+                irp->IoStatus.Status = STATUS_TIMEOUT;
+                irp->IoStatus.Information = 0;
+                IoReleaseRemoveLock( &remove_lock, irp );
+                IoCompleteRequest( irp, IO_NO_INCREMENT );
+                return STATUS_TIMEOUT;
             }
 
-            // Export the captured output into user-mode memory, outside LL.
+            // Export the captured output into user-mode memory; the worker
+            // is parked on consumed_event and frees the buffers after this.
             //
             const auto export_to_um = [ ] ( captured_buffer& buf ) -> char*
             {
@@ -261,13 +371,47 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
 
             if ( output_length >= sizeof( ntlua_result ) )
             {
-                result->errors  = export_to_um( errors_copy );
-                result->outputs = export_to_um( outputs_copy );
+                result->errors  = export_to_um( req->errors_copy );
+                result->outputs = export_to_um( req->outputs_copy );
                 irp->IoStatus.Information = sizeof( ntlua_result );
             }
-
-            if ( errors_copy.data )  free( errors_copy.data );
-            if ( outputs_copy.data ) free( outputs_copy.data );
+            KeSetEvent( &req->consumed_event, IO_NO_INCREMENT, FALSE );
+        }
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_TAIL_TRACE )
+    {
+        irp->IoStatus.Information = 0;
+        NTSTATUS trace_status = trace::tail_trace( irp, sp );
+        if ( !NT_SUCCESS( trace_status ) )
+        {
+            irp->IoStatus.Status = trace_status;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return trace_status;
+        }
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_TRACE_CTL )
+    {
+        irp->IoStatus.Information = 0;
+        NTSTATUS trace_status = trace::trace_ctl( irp, sp );
+        if ( !NT_SUCCESS( trace_status ) )
+        {
+            irp->IoStatus.Status = trace_status;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return trace_status;
+        }
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_TAIL_LOG )
+    {
+        irp->IoStatus.Information = 0;
+        NTSTATUS log_status = log_ring::tail_log( irp, sp );
+        if ( !NT_SUCCESS( log_status ) )
+        {
+            irp->IoStatus.Status = log_status;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return log_status;
         }
     }
     else
@@ -304,6 +448,7 @@ void unload_driver( PDRIVER_OBJECT driver )
     callback::run_teardown( L );
     callback::destroy( L );
     lua::destroy( L );
+    logger::shutdown();
 
     // Delete the symbolic link.
     //
@@ -341,9 +486,21 @@ NTSTATUS security_check( PDEVICE_OBJECT device_object, PIRP irp )
 //
 extern "C" NTSTATUS DriverEntry( DRIVER_OBJECT* DriverObject, UNICODE_STRING* RegistryPath )
 {
+    // Logger before anything can print into it (pool-backed, see logger.hpp).
+    //
+    logger::init();
+
     // Run static initializers.
     //
     crt::initialize();
+
+    // Trace ring before any VM execution can emit into it.
+    //
+    trace::init();
+
+    // Tail log ring before any print() can emit into it.
+    //
+    log_ring::init();
 
     // Initialize the VM lock before any IOCTL or callback can touch it.
     //

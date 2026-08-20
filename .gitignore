@@ -25,3 +25,12 @@ LuaLib/x64/Debug/
 /ActualConsole/x64/Release
 /ActualConsole/ActualConsole/x64/Release
 /KernelLuaVm/x64/Release
+*.rar
+/distributables
+/Loader
+/LuaLib/luac/x64/Release
+*.enc
+
+# OpenCode session artifacts
+.omo/
+GoodmansKernel

@@ -1,5 +1,6 @@
-#include "../logger.hpp"
 #include "crt.h"
+#include "../logger.hpp"
+#include "../log_ring.hpp"
 
 FILE* __stdcall __acrt_iob_func( unsigned i )
 {
@@ -17,12 +18,16 @@ size_t fwrite( const void* ptr, size_t size, size_t count, FILE* stream )
 {
     if ( stream == FILE_STDOUT )
     {
-        logger::logs.append_raw( ( const char* ) ptr, size * count );
+        if ( logger::string_buffer* b = logger::log_buffer() )
+            b->append_raw( ( const char* ) ptr, size * count );
+        log_ring::push( ( const char* ) ptr, size * count );
         return count;
     }
     else if ( stream == FILE_STDERR )
     {
-        logger::errors.append_raw( ( const char* ) ptr, size * count );
+        if ( logger::string_buffer* b = logger::error_buffer() )
+            b->append_raw( ( const char* ) ptr, size * count );
+        log_ring::push( ( const char* ) ptr, size * count );
         return count;
     }
     return 0;

@@ -154,6 +154,65 @@ int main( int argc, const char** argv )
                 &discarded, nullptr
             );
         }
+        else if ( buffer == "trace on" || buffer == "trace off" )
+        {
+            ntlua_trace_ctl_in ctl = {};
+            ctl.mode = ( buffer == "trace on" ) ? NTLUA_TRACE_ON : NTLUA_TRACE_OFF;
+            DWORD discarded = 0;
+            DeviceIoControl( device, NTLUA_TRACE_CTL, &ctl, sizeof( ctl ), nullptr, 0, &discarded, nullptr );
+            printf( "tracing %s\n", ctl.mode == NTLUA_TRACE_ON ? "on" : "off" );
+        }
+        else if ( buffer == "trace dump" )
+        {
+            // Poll the ring from the last sequence and print every entry.
+            //
+            static uint64_t last_seq = 0;
+            ntlua_trace_in in = {};
+            ntlua_trace_out out = {};
+            in.last_seq = last_seq;
+            DWORD discarded = 0;
+            if ( DeviceIoControl( device, NTLUA_TAIL_TRACE, &in, sizeof( in ), &out, sizeof( out ), &discarded, nullptr ) )
+            {
+                if ( out.dropped )
+                    printf( "(dropped %u entries)\n", out.dropped );
+                for ( uint32_t i = 0; i < out.count; i++ )
+                {
+                    const auto& e = out.entries[ i ];
+                    static const char* kinds[] = { "?", "IMPORT", "CALL", "RETURN", "TRAP" };
+                    const char* kind = e.kind <= NTLUA_TRK_TRAP ? kinds[ e.kind ] : "?";
+                    printf( "%-6s tid=%04u irql=%u %s rv=0x%llX\n",
+                            kind, e.thread_id, e.irql, e.name, e.rv );
+                    if ( e.argc )
+                    {
+                        printf( "        args: " );
+                        for ( uint32_t a = 0; a < e.argc; a++ )
+                            printf( "%s0x%llX", a ? ", " : "", e.argv[ a ] );
+                        printf( "\n" );
+                    }
+                }
+                printf( "%u trace entries\n", out.count );
+                last_seq = out.next_seq;
+            }
+        }
+        else if ( buffer == "log dump" )
+        {
+            // Poll the log ring from the last sequence and print every line.
+            //
+            static uint64_t last_seq = 0;
+            ntlua_log_in in = {};
+            ntlua_log_out out = {};
+            in.last_seq = last_seq;
+            DWORD discarded = 0;
+            if ( DeviceIoControl( device, NTLUA_TAIL_LOG, &in, sizeof( in ), &out, sizeof( out ), &discarded, nullptr ) )
+            {
+                if ( out.dropped )
+                    printf( "(dropped %u log lines)\n", out.dropped );
+                for ( uint32_t i = 0; i < out.count; i++ )
+                    puts( out.entries[ i ].line );
+                printf( "%u log lines\n", out.count );
+                last_seq = out.next_seq;
+            }
+        }
         else
         {
             execute( buffer.data(), false );
