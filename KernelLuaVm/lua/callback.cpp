@@ -1,6 +1,7 @@
 #include "callback.hpp"
 #include "../logger.hpp"
 #include "../trace_ring.hpp"
+#include "../vm.hpp"
 #include "native_function.hpp"
 
 // - Admission gate ISA -
@@ -41,7 +42,8 @@ static constexpr uint64_t PASS_THROUGH_SENTINEL = 0x4E744C7561504153; // "NtLuaP
 //
 struct callback_registration
 {
-    int       lua_ref   = LUA_NOREF;   // luaL_ref, or LUA_NOREF if free
+    vm_instance* owner      = nullptr;  // instance that owns this slot
+    int       lua_ref   = LUA_NOREF;   // luaL_ref in owner->L's registry, or LUA_NOREF if free
     uint8_t   arg_count = 0;           // args pushed to Lua / forwarded to fallback
     uint8_t   fallback_ret_width = 8;  // trusted result bytes for the fallback call
     bool      active    = false;       // slot in use
@@ -75,22 +77,10 @@ static void*                  cb_trampoline_table[ callback::MAX_EVENTS ];
 static EX_RUNDOWN_REF         callback_rundown;
 static bool                   callback_rundown_initialized = false;
 
-static constexpr int MAX_TEARDOWN_CALLBACKS = 32;
-static int teardown_refs[ MAX_TEARDOWN_CALLBACKS ];
 static volatile bool accepting_teardown = false;
 
-struct tracked_patch
-{
-    uint64_t target      = 0;
-    uint64_t original    = 0;
-    uint64_t replacement = 0;
-    uint8_t  width       = 8;
-    bool     active      = false;
-};
-
-static constexpr int MAX_TRACKED_PATCHES = 256;
-static tracked_patch tracked_patches[ MAX_TRACKED_PATCHES ];
-static LONG64 patch_conflicts = 0;
+// Per-instance teardown refs, tracked patches and conflict counters moved
+// into vm_instance (vm.hpp) - each instance owns its own set now.
 
 // - Capture Trampoline Template -
 //
@@ -280,10 +270,12 @@ static bool gate_eval( int event_id, const uint64_t args[ 16 ], uint64_t thread,
 // on the same state, and restoring the top (instead of clearing to 0)
 // keeps that outer frame's values intact.
 //
-static uint64_t run_handler( int event_id, const uint64_t args[16], uint64_t thread, uint64_t stack_base, uint64_t rsp )
+static uint64_t run_handler( vm_instance* owner, int event_id, const uint64_t args[16], uint64_t thread, uint64_t stack_base, uint64_t rsp )
 {
+    lua_State* L = owner->L;
+
     // Re-check active - ensures we don't access L after unload_driver has
-    // destroyed it (unload holds LL while calling lua::destroy).
+    // destroyed it (unload holds the instance lock while calling lua::destroy).
     //
     if ( !cb_registry[ event_id ].active ||
          cb_registry[ event_id ].lua_ref == LUA_NOREF )
@@ -390,12 +382,22 @@ namespace callback
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return 0;
 
+        // Resolve the owning instance. The instance structs are a fixed,
+        // never-freed pool, so `owner` is always a live object; only its L /
+        // log_session are mutable, and those are read strictly under the
+        // instance lock (below) so a concurrent destroy can never free them
+        // mid-dispatch.
+        //
+        const callback_registration& reg = cb_registry[ event_id ];
+        vm_instance* owner = reg.owner;
+        if ( !owner )
+            return 0;
+
         // Snapshot the fallback fields up front so the early-return paths can
         // route to them without taking cb_registry_lock. Aligned 8-byte reads
         // are atomic on x64; a concurrent SetFallback may briefly pair a new
         // address with the previous width (benign - width is almost always 8).
         //
-        const callback_registration& reg = cb_registry[ event_id ];
         const void* fb_addr  = reg.fallback_address;
         uint8_t     fb_width = reg.fallback_ret_width;
         uint64_t    fb_value = reg.fallback_value;
@@ -404,7 +406,8 @@ namespace callback
         // Admission gate: evaluated before anything else, at any IRQL, with
         // no locks. A rejected event never approaches the VM, so an
         // ungated-hot event (e.g. GetCpuClock on every syscall) costs a few
-        // nanoseconds in the common case instead of contending for LL.
+        // nanoseconds in the common case instead of contending for the
+        // instance lock.
         //
         const LONG gate_len = reg.gate_len;
         if ( gate_len && !gate_eval( event_id, args, thread, rsp, stack_base ) )
@@ -419,17 +422,24 @@ namespace callback
 
         // Same-thread re-entry: a Lua script (REPL or another handler) called
         // into the kernel via the FFI and triggered a hooked callback on this
-        // very thread. LL is already held, so mutual exclusion against other
-        // threads is guaranteed; re-acquiring the non-reentrant mutex would
-        // deadlock, and dropping the event to the fallback would miss it.
-        // Nested lua_pcall on the same state from the same thread is legal -
-        // the interpreter re-enters itself the same way for metamethods - and
-        // run_handler restores the stack top, so the in-flight frames above
-        // us are untouched. Run the handler inline.
+        // very thread. The instance lock is already held by this thread, so
+        // mutual exclusion against other threads (and destroy) is guaranteed;
+        // re-acquiring the non-reentrant mutex would deadlock, and dropping
+        // the event to the fallback would miss it. Nested lua_pcall on the
+        // same state from the same thread is legal - the interpreter re-enters
+        // itself the same way for metamethods - and run_handler restores the
+        // stack top, so the in-flight frames above us are untouched. Run the
+        // handler inline.
         //
-        if ( LL.owned_by_current() )
+        if ( owner->lock.owned_by_current() )
         {
-            uint64_t result = run_handler( event_id, args, thread, stack_base, rsp );
+            if ( !owner->L )
+                return 0;
+
+            logger::route_begin( owner->log_session );
+            uint64_t result = run_handler( owner, event_id, args, thread, stack_base, rsp );
+            logger::route_end();
+
             // Same conversion as the main path below: a handler asking to
             // pass through must reach the native fallback, not leak the
             // sentinel value to the kernel caller.
@@ -439,12 +449,12 @@ namespace callback
             return result;
         }
 
-        // A gate match waits for LL (never misses merely because the VM is
-        // busy) but never unbounded: matches on syscall-rate hooks can
-        // otherwise queue faster than the serialized VM drains them and
-        // convoy the machine. Gated events default to a 250ms ceiling;
-        // SetWait overrides per event (0 = restore defaults). A timeout
-        // degrades to the fallback and counts in lock_misses.
+        // A gate match waits for the instance lock (never misses merely
+        // because the VM is busy) but never unbounded: matches on
+        // syscall-rate hooks can otherwise queue faster than the serialized
+        // VM drains them and convoy the machine. Gated events default to a
+        // 250ms ceiling; SetWait overrides per event (0 = restore defaults).
+        // A timeout degrades to the fallback and counts in lock_misses.
         //
         bool acquired;
         if ( gate_len != 0 || !cb_registry[ event_id ].nonblocking )
@@ -452,11 +462,11 @@ namespace callback
             uint32_t wait = cb_registry[ event_id ].wait_ms;
             if ( gate_len != 0 && wait == 0 )
                 wait = 250;
-            acquired = ( wait == 0 ) ? ( LL.lock(), true ) : LL.lock_for( wait );
+            acquired = ( wait == 0 ) ? ( owner->lock.lock(), true ) : owner->lock.lock_for( wait );
         }
         else
         {
-            acquired = LL.try_lock();
+            acquired = owner->lock.try_lock();
         }
 
         if ( !acquired )
@@ -465,8 +475,20 @@ namespace callback
             return invoke_fallback( fb_addr, fb_width, fb_argc, fb_value, args );
         }
 
-        uint64_t result = run_handler( event_id, args, thread, stack_base, rsp );
-        LL.unlock();
+        // Under the instance lock the instance's L and log_session are stable:
+        // destroy holds this same lock while it nulls L and frees the session,
+        // so it cannot free them while we are here.
+        //
+        if ( !owner->L )
+        {
+            owner->lock.unlock();
+            return 0;
+        }
+
+        logger::route_begin( owner->log_session );
+        uint64_t result = run_handler( owner, event_id, args, thread, stack_base, rsp );
+        logger::route_end();
+        owner->lock.unlock();
 
         if ( result == PASS_THROUGH_SENTINEL )
             return invoke_fallback( fb_addr, fb_width, fb_argc, fb_value, args );
@@ -534,14 +556,14 @@ namespace callback
         return true;
     }
 
-    static bool restore_all_patches()
+    static bool restore_all_patches( vm_instance* inst )
     {
         bool success = true;
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
-        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
+        for ( int i = 0; i < vm_instance::MAX_TRACKED_PATCHES; i++ )
         {
-            tracked_patch& patch = tracked_patches[ i ];
+            tracked_patch& patch = inst->patches[ i ];
             if ( !patch.active )
                 continue;
 
@@ -559,7 +581,7 @@ namespace callback
             }
             else
             {
-                InterlockedIncrement64( &patch_conflicts );
+                InterlockedIncrement64( &inst->patch_conflicts );
             }
             patch.active = false;
         }
@@ -582,14 +604,9 @@ namespace callback
         }
         accepting_teardown = true;
 
-        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
-            teardown_refs[ i ] = LUA_NOREF;
-        patch_conflicts = 0;
-        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
-            tracked_patches[ i ] = {};
-
         for ( int i = 0; i < MAX_EVENTS; i++ )
         {
+            cb_registry[ i ].owner               = nullptr;
             cb_registry[ i ].lua_ref            = LUA_NOREF;
             cb_registry[ i ].arg_count          = 0;
             cb_registry[ i ].active             = false;
@@ -618,6 +635,7 @@ namespace callback
         accepting_teardown = false;
         for ( int i = 0; i < MAX_EVENTS; i++ )
         {
+            cb_registry[ i ].owner              = nullptr;
             cb_registry[ i ].active             = false;
             cb_registry[ i ].fallback_address   = nullptr;
             cb_registry[ i ].fallback_ret_width = 8;
@@ -632,15 +650,16 @@ namespace callback
         ExWaitForRundownProtectionRelease( &callback_rundown );
     }
 
-    void run_teardown( lua_State* Ls )
+    void run_teardown( vm_instance* inst )
     {
+        lua_State* Ls = inst->L;
         int base = lua_gettop( Ls );
-        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+        for ( int i = 0; i < vm_instance::MAX_TEARDOWN_CALLBACKS; i++ )
         {
-            if ( teardown_refs[ i ] == LUA_NOREF )
+            if ( inst->teardown_refs[ i ] == LUA_NOREF )
                 continue;
 
-            lua_rawgeti( Ls, LUA_REGISTRYINDEX, teardown_refs[ i ] );
+            lua_rawgeti( Ls, LUA_REGISTRYINDEX, inst->teardown_refs[ i ] );
             if ( lua_pcall( Ls, 0, 0, 0 ) )
             {
                 const char* message = lua_tostring( Ls, -1 );
@@ -650,16 +669,22 @@ namespace callback
         }
     }
 
-    void destroy( lua_State* Ls )
+    void destroy( vm_instance* inst )
     {
+        lua_State* Ls = inst->L;
         int refs[ callback::MAX_EVENTS ];
-        int cleanup_refs[ MAX_TEARDOWN_CALLBACKS ];
 
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
         for ( int i = 0; i < MAX_EVENTS; i++ )
         {
+            if ( cb_registry[ i ].owner != inst )
+            {
+                refs[ i ] = LUA_NOREF;
+                continue;
+            }
             refs[ i ] = cb_registry[ i ].lua_ref;
+            cb_registry[ i ].owner             = nullptr;
             cb_registry[ i ].lua_ref            = LUA_NOREF;
             cb_registry[ i ].active             = false;
             cb_registry[ i ].arg_count          = 0;
@@ -671,10 +696,9 @@ namespace callback
             cb_registry[ i ].lock_misses        = 0;
             cb_registry[ i ].gate_len           = 0;
         }
-        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+        for ( int i = 0; i < vm_instance::MAX_TEARDOWN_CALLBACKS; i++ )
         {
-            cleanup_refs[ i ] = teardown_refs[ i ];
-            teardown_refs[ i ] = LUA_NOREF;
+            inst->teardown_refs[ i ] = LUA_NOREF;
         }
         KeReleaseSpinLock( &cb_registry_lock, old );
 
@@ -683,13 +707,8 @@ namespace callback
             if ( refs[ i ] != LUA_NOREF )
                 luaL_unref( Ls, LUA_REGISTRYINDEX, refs[ i ] );
         }
-        for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
-        {
-            if ( cleanup_refs[ i ] != LUA_NOREF )
-                luaL_unref( Ls, LUA_REGISTRYINDEX, cleanup_refs[ i ] );
-        }
 
-        if ( !restore_all_patches() )
+        if ( !restore_all_patches( inst ) )
             logger::error( "tracked patch restoration fault\n" );
     }
 
@@ -713,6 +732,10 @@ namespace callback
 
     static int allocate_event( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
         int found = -1;
@@ -722,6 +745,7 @@ namespace callback
             {
                 found = i;
                 cb_registry[ i ].active = true;
+                cb_registry[ i ].owner  = inst;
                 break;
             }
         }
@@ -736,6 +760,10 @@ namespace callback
 
     static int set_handler( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         int event_id  = (int) luaL_checkunsigned( Ls, 1 );
         uint64_t arg_count_value = luaL_checkunsigned( Ls, 2 );
         int arg_count = ( int ) arg_count_value;
@@ -744,9 +772,12 @@ namespace callback
             return luaL_error( Ls, "invalid event_id %d", event_id );
         if ( arg_count_value > 16 )
             return luaL_error( Ls, "arg_count must be between 0 and 16" );
+        if ( cb_registry[ event_id ].owner != inst )
+            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
 
         // Push the Lua function (arg 3) and ref it in the registry.
-        // Done at PASSIVE_LEVEL (called from REPL via IOCTL, LL is held).
+        // Done at PASSIVE_LEVEL (called from REPL via IOCTL, the instance
+        // lock is held).
         //
         lua_pushvalue( Ls, 3 );
         int new_ref = luaL_ref( Ls, LUA_REGISTRYINDEX );
@@ -790,6 +821,7 @@ namespace callback
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
         int ref = cb_registry[ event_id ].lua_ref;
+        cb_registry[ event_id ].owner    = nullptr;
         cb_registry[ event_id ].lua_ref = LUA_NOREF;
         cb_registry[ event_id ].active  = false;
         cb_registry[ event_id ].fallback_address = nullptr;
@@ -888,6 +920,10 @@ namespace callback
 
     static int on_teardown( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         luaL_checktype( Ls, 1, LUA_TFUNCTION );
         lua_pushvalue( Ls, 1 );
         int ref = luaL_ref( Ls, LUA_REGISTRYINDEX );
@@ -897,11 +933,11 @@ namespace callback
         KeAcquireSpinLock( &cb_registry_lock, &old );
         if ( accepting_teardown )
         {
-            for ( int i = 0; i < MAX_TEARDOWN_CALLBACKS; i++ )
+            for ( int i = 0; i < vm_instance::MAX_TEARDOWN_CALLBACKS; i++ )
             {
-                if ( teardown_refs[ i ] == LUA_NOREF )
+                if ( inst->teardown_refs[ i ] == LUA_NOREF )
                 {
-                    teardown_refs[ i ] = ref;
+                    inst->teardown_refs[ i ] = ref;
                     slot = i;
                     break;
                 }
@@ -922,6 +958,10 @@ namespace callback
 
     static int track_patch( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         uint64_t target = luaL_checkunsigned( Ls, 1 );
         uint64_t replacement = luaL_checkunsigned( Ls, 2 );
         uint8_t width = 8;
@@ -935,12 +975,15 @@ namespace callback
         if ( target < 0xFFFF800000000000ull )
             return luaL_error( Ls, "patch target is not a canonical kernel address" );
 
+        auto& patches = inst->patches;
+        const int cap = vm_instance::MAX_TRACKED_PATCHES;
+
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
 
-        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
+        for ( int i = 0; i < cap; i++ )
         {
-            const tracked_patch& patch = tracked_patches[ i ];
+            const tracked_patch& patch = patches[ i ];
             if ( patch.active && patch.target == target &&
                  patch.replacement == replacement && patch.width == width )
             {
@@ -956,9 +999,9 @@ namespace callback
         }
 
         int slot = -1;
-        for ( int i = 0; i < MAX_TRACKED_PATCHES; i++ )
+        for ( int i = 0; i < cap; i++ )
         {
-            if ( !tracked_patches[ i ].active )
+            if ( !patches[ i ].active )
             {
                 slot = i;
                 break;
@@ -978,7 +1021,7 @@ namespace callback
             return luaL_error( Ls, "could not read or write patch target" );
         }
 
-        tracked_patches[ slot ] = { target, original, replacement, width, true };
+        patches[ slot ] = { target, original, replacement, width, true };
         KeReleaseSpinLock( &cb_registry_lock, old );
         lua_pushunsigned( Ls, slot );
         return 1;
@@ -986,14 +1029,18 @@ namespace callback
 
     static int restore_patch( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         uint64_t id = luaL_checkunsigned( Ls, 1 );
-        if ( id >= MAX_TRACKED_PATCHES )
+        if ( id >= vm_instance::MAX_TRACKED_PATCHES )
             return luaL_error( Ls, "invalid patch id" );
 
         bool restored = false;
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
-        tracked_patch& patch = tracked_patches[ id ];
+        tracked_patch& patch = inst->patches[ id ];
         if ( patch.active )
         {
             uint64_t current = 0;
@@ -1002,7 +1049,7 @@ namespace callback
                 if ( current == patch.replacement )
                     restored = patch_write( patch.target, patch.width, patch.original );
                 else
-                    InterlockedIncrement64( &patch_conflicts );
+                    InterlockedIncrement64( &inst->patch_conflicts );
                 patch.active = false;
             }
         }
@@ -1013,13 +1060,19 @@ namespace callback
 
     static int restore_all_patches_lua( lua_State* Ls )
     {
-        lua_pushboolean( Ls, restore_all_patches() );
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+        lua_pushboolean( Ls, restore_all_patches( inst ) );
         return 1;
     }
 
     static int patch_conflicts_lua( lua_State* Ls )
     {
-        lua_pushinteger( Ls, patch_conflicts );
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+        lua_pushinteger( Ls, inst->patch_conflicts );
         return 1;
     }
 

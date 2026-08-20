@@ -84,8 +84,88 @@ namespace logger
         string_buffer errors;
     };
 
-    inline session* active = nullptr;   // set under LL by the execution worker
+    // Per-thread output routing.
+    //
+    // A chunk of Lua execution (REPL, a callback handler, or a worker poll)
+    // must route its print()/logger writes into the instance's session. That
+    // routing lives in a small thread-keyed table rather than a single global
+    // because the driver runs several threads - multiple per-instance worker
+    // threads, IRP execution threads and callback dispatch threads - which can
+    // execute Lua chunks CONCURRENTLY on different instances. A shared global
+    // "active session" would let instance A's thread route output into
+    // instance B's session (a data race). __declspec(thread) cannot be used
+    // here (forbidden under /kernel), so each thread registers its current
+    // session in a fixed table while it runs a chunk.
+    //
+    struct route_slot
+    {
+        void*    thread = nullptr;      // ETHREAD*
+        int      depth  = 0;
+        session* sess[ 4 ] = {};        // nesting stack (nested re-entry on one thread)
+    };
+    inline route_slot route_table[ 16 ] = {};
+    inline KSPIN_LOCK route_lock = { 0 };
     inline session* global = nullptr;   // pool-backed, see init/shutdown
+
+    inline void route_begin( session* sess )
+    {
+        if ( !sess ) return;
+        KIRQL irql;
+        KeAcquireSpinLock( &route_lock, &irql );
+        void* self = KeGetCurrentThread();
+        for ( int i = 0; i < 16; i++ )
+        {
+            if ( route_table[ i ].thread == self )
+            {
+                if ( route_table[ i ].depth < 4 )
+                    route_table[ i ].sess[ route_table[ i ].depth++ ] = sess;
+                break;
+            }
+            if ( !route_table[ i ].thread )
+            {
+                route_table[ i ].thread = self;
+                route_table[ i ].depth  = 1;
+                route_table[ i ].sess[ 0 ] = sess;
+                break;
+            }
+        }
+        KeReleaseSpinLock( &route_lock, irql );
+    }
+
+    inline void route_end()
+    {
+        KIRQL irql;
+        KeAcquireSpinLock( &route_lock, &irql );
+        void* self = KeGetCurrentThread();
+        for ( int i = 0; i < 16; i++ )
+        {
+            if ( route_table[ i ].thread == self )
+            {
+                if ( route_table[ i ].depth > 0 )
+                    route_table[ i ].depth--;
+                if ( route_table[ i ].depth == 0 )
+                {
+                    route_table[ i ].thread = nullptr;
+                    route_table[ i ].sess[ 0 ] = nullptr;
+                }
+                break;
+            }
+        }
+        KeReleaseSpinLock( &route_lock, irql );
+    }
+
+    inline session* current_session()
+    {
+        void* self = KeGetCurrentThread();
+        for ( int i = 0; i < 16; i++ )
+        {
+            if ( route_table[ i ].thread == self && route_table[ i ].depth > 0 )
+                return route_table[ i ].sess[ route_table[ i ].depth - 1 ];
+        }
+        return global;
+    }
+    inline string_buffer* log_buffer()   { session* s = current_session(); return s ? &s->logs   : nullptr; }
+    inline string_buffer* error_buffer() { session* s = current_session(); return s ? &s->errors : nullptr; }
 
     inline bool init()
     {
@@ -99,15 +179,18 @@ namespace logger
     {
         if ( global ) ExFreePool( global );
         global = nullptr;
-        active = nullptr;
+        for ( int i = 0; i < 16; i++ )
+        {
+            route_table[ i ].thread = nullptr;
+            route_table[ i ].depth  = 0;
+            for ( int k = 0; k < 4; k++ )
+                route_table[ i ].sess[ k ] = nullptr;
+        }
     }
 
     // Returns null before init() (or after shutdown); callers treat it as
     // "no output destination" and drop the write.
     //
-    inline string_buffer* log_buffer()   { return active ? &active->logs   : ( global ? &global->logs   : nullptr ); }
-    inline string_buffer* error_buffer() { return active ? &active->errors : ( global ? &global->errors : nullptr ); }
-
     template<typename... T> inline int error( const char* format, T... args )
     { string_buffer* b = error_buffer(); return b ? b->append( format, args... ) : 0; }
     template<typename... T> inline int log( const char* format, T... args )

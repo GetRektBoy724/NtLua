@@ -4,6 +4,8 @@
 #include <intrin.h>
 #include "state.hpp"
 
+struct vm_instance;  // fwd decl - full type in vm.hpp, included by callback.cpp
+
 // VM lock with owner tracking (for callback reentrancy detection).
 // Moved here from main.cpp so both main.cpp and callback.cpp can use it.
 // Backed by a KMUTEX so the blocking path waits at PASSIVE_LEVEL instead of
@@ -79,11 +81,6 @@ struct unique_lock
     }
 };
 
-// Globals - defined in main.cpp, used by callback.cpp.
-//
-extern lua_State* L;
-extern vm_lock LL;
-
 // Universal callback bridge.
 //
 namespace callback
@@ -98,13 +95,14 @@ namespace callback
     //
     void begin_teardown();
 
-    // Run registered Lua cleanup callbacks while L is still valid.
+    // Run registered Lua cleanup callbacks on inst; the instance's state is
+    // destructible afterwards.
     //
-    void run_teardown( lua_State* L );
+    void run_teardown( vm_instance* inst );
 
-    // Clear callback and teardown registry references from L.
+    // Clear callback, teardown and patch references owned by inst.
     //
-    void destroy( lua_State* L );
+    void destroy( vm_instance* inst );
 
     // Expose callback Lua API to a Lua state.
     // Adds: AllocateEvent, SetHandler, GetTrampoline, FreeEvent,

@@ -4,6 +4,7 @@
 #include "logger.hpp"
 #include "trace_ring.hpp"
 #include "log_ring.hpp"
+#include "vm.hpp"
 #include "lua/state.hpp"
 #include "lua/native_function.hpp"
 #include "driver_io.hpp"
@@ -14,98 +15,7 @@
 
 // Global Lua context and attaching helpers.
 //
-lua_State* L = nullptr;
-vm_lock LL = {};
 IO_REMOVE_LOCK remove_lock = {};
-
-PEPROCESS attached_process = nullptr;
-KAPC_STATE apc_state;
-volatile void* context_owner = nullptr;
-bool context_active = false;
-bool process_attached = false;
-
-namespace lua
-{
-    static void begin_ctx()
-    {
-        context_owner = ( void* ) KeGetCurrentThread();
-        context_active = true;
-        if ( attached_process )
-        {
-            if ( PsGetProcessExitStatus( attached_process ) != STATUS_PENDING )
-            {
-                ObDereferenceObject( attached_process );
-                attached_process = nullptr;
-            }
-            else
-            {
-                KeStackAttachProcess( attached_process, &apc_state );
-                process_attached = true;
-            }
-        }
-    }
-    static void end_ctx()
-    {
-        __writecr8( 0 );
-        _enable();
-        if ( process_attached )
-        {
-            KeUnstackDetachProcess( &apc_state );
-            process_attached = false;
-        }
-        context_active = false;
-        context_owner = nullptr;
-    }
-
-    bool detach()
-    {
-        if ( !context_active || context_owner != ( void* ) KeGetCurrentThread() )
-            return false;
-        if ( process_attached )
-        {
-            KeUnstackDetachProcess( &apc_state );
-            process_attached = false;
-        }
-        ObDereferenceObject( attached_process );
-        attached_process = nullptr;
-        return true;
-    }
-    bool attach_process( PEPROCESS process )
-    {
-        if ( !context_active || context_owner != ( void* ) KeGetCurrentThread() )
-            return false;
-        if ( !ObReferenceObjectSafe( process ) )
-            return false;
-
-        detach();
-        attached_process = process;
-        KeStackAttachProcess( process, &apc_state );
-        process_attached = true;
-        return true;
-    }
-    bool attach_pid( uint64_t pid )
-    {
-        if ( !context_active || context_owner != ( void* ) KeGetCurrentThread() )
-            return false;
-
-        PEPROCESS process = nullptr;
-        PsLookupProcessByProcessId( ( HANDLE ) pid, &process );
-        if ( !process ) 
-            return false;
-
-        if ( process_attached )
-        {
-            KeUnstackDetachProcess( &apc_state );
-            process_attached = false;
-        }
-        if ( attached_process )
-            ObDereferenceObject( attached_process );
-        attached_process = process;
-        KeStackAttachProcess( process, &apc_state );
-        process_attached = true;
-        return true;
-    }
-};
 
 // Bounded wait for a NTLUA_RUN chunk. A script wedged inside a blocking
 // native FFI call can never be preempted (the instruction hook only fires
@@ -127,6 +37,7 @@ struct captured_buffer
 //
 struct execution_request
 {
+    vm_instance* instance;            // the VM this chunk executes on
     char* code;                       // points into this allocation
     char* chunkname;                  // points into this allocation
     captured_buffer errors_copy;      // filled by the execution thread
@@ -137,25 +48,28 @@ struct execution_request
 };
 
 // Executes one chunk on its own system thread so the NTLUA_RUN IOCTL can
-// bound the wait. Runs under LL exactly like the old inline path, then hands
-// the captured output to the caller and only frees the request once the
-// caller has consumed it or signalled abort.
+// bound the wait. Runs under the instance's lock exactly like the old inline
+// path, then hands the captured output to the caller and only frees the
+// request once the caller has consumed it or signalled abort.
 //
 static VOID NTAPI vm_execution_worker( PVOID start_context )
 {
     execution_request* req = ( execution_request* ) start_context;
+    vm_instance* inst = req->instance;
 
     {
-        unique_lock _g{ LL };
+        unique_lock _g{ inst->lock };
 
         // Queued behind a wedged chunk and the caller gave up meanwhile - do
         // no work, just free the request.
         //
         if ( !KeReadStateEvent( &req->abort_event ) )
         {
-            lua::begin_ctx();
-            lua::execute( L, req->code, true, req->chunkname );
-            lua::end_ctx();
+            vm::begin_ctx( inst );
+            logger::route_begin( inst->log_session );
+            lua::execute( inst->L, req->code, true, req->chunkname );
+            logger::route_end();
+            vm::end_ctx( inst );
 
             // Capture only the output produced since the last capture
             // (watermark), so print() from callbacks that fire between
@@ -177,10 +91,10 @@ static VOID NTAPI vm_execution_worker( PVOID start_context )
                 return out;
             };
 
-            if ( logger::global )
+            if ( inst->log_session )
             {
-                req->errors_copy  = capture( logger::global->errors );
-                req->outputs_copy = capture( logger::global->logs );
+                req->errors_copy  = capture( inst->log_session->errors );
+                req->outputs_copy = capture( inst->log_session->logs );
             }
 
             // Flush any trailing partial line (print() without a newline) so
@@ -190,8 +104,8 @@ static VOID NTAPI vm_execution_worker( PVOID start_context )
         }
     }
 
-    // Release LL before waiting: the user-mode export below must not happen
-    // under the VM lock.
+    // Release the lock before waiting: the user-mode export below must not
+    // happen under the VM lock.
     //
     KeSetEvent( &req->done_event, IO_NO_INCREMENT, FALSE );
 
@@ -217,36 +131,93 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
 
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation( irp );
 
+    // Reset a single VM instance: destroy its Lua state + callbacks and
+    // re-create a fresh one (same log session, same instance slot, same
+    // instance id). The instance lock is held throughout, so dispatch is
+    // blocked; concurrent dispatches that have already resolved `owner` see
+    // inst->L == nullptr under the lock and bail to the fallback. Returns
+    // STATUS_INSUFFICIENT_RESOURCES on re-init failure (instance is left in
+    // a torn-down state — caller can vm kill it and vm new a fresh one).
+    //
+    auto reset_instance = [ & ] ( vm_instance* inst ) -> NTSTATUS
+    {
+        unique_lock _g{ inst->lock };
+        callback::run_teardown( inst );
+        callback::destroy( inst );
+        lua::destroy( inst->L );
+        inst->L = lua::init();
+        if ( !inst->L )
+            return STATUS_INSUFFICIENT_RESOURCES;
+
+        lua::set_context_owner( inst->L, inst );
+        lua::expose_api( inst->L );
+        callback::init();
+        callback::expose_api( inst->L );
+        return STATUS_SUCCESS;
+    };
+
     // Handle the command.
     //
     if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RESET )
     {
-        callback::begin_teardown();
-        unique_lock _g{ LL };
-        callback::run_teardown( L );
-        callback::destroy( L );
-        lua::destroy( L );
-        L = lua::init();
-        if ( !L )
+        vm_instance* inst = &vm::instances[ 0 ];
+        if ( !inst->active )
         {
-            callback::init();
-            irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
             irp->IoStatus.Information = 0;
             IoReleaseRemoveLock( &remove_lock, irp );
             IoCompleteRequest( irp, IO_NO_INCREMENT );
-            return STATUS_INSUFFICIENT_RESOURCES;
+            return STATUS_DEVICE_NOT_READY;
         }
-
-        // A reset VM is useless without its API (the old code re-created a
-        // bare state with no globals exposed).
+        // Legacy reset additionally shuts down the callback bridge globally
+        // (trampolines become no-ops) before re-initialising instance 0.
         //
-        lua::expose_api( L );
-        callback::init();
-        callback::expose_api( L );
+        callback::begin_teardown();
+        NTSTATUS reset_status = reset_instance( inst );
+        if ( !NT_SUCCESS( reset_status ) )
+        {
+            irp->IoStatus.Status = reset_status;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return reset_status;
+        }
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_RESET )
+    {
+        void* buf = irp->AssociatedIrp.SystemBuffer;
+        if ( !buf || sp->Parameters.DeviceIoControl.InputBufferLength < sizeof( unsigned int ) )
+        {
+            irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INVALID_PARAMETER;
+        }
+        unsigned int id = *( unsigned int* ) buf;
+        vm_instance* inst = vm::by_id( id );
+        if ( !inst )
+        {
+            irp->IoStatus.Status = STATUS_NOT_FOUND;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_NOT_FOUND;
+        }
+        NTSTATUS reset_status = reset_instance( inst );
+        if ( !NT_SUCCESS( reset_status ) )
+        {
+            irp->IoStatus.Status = reset_status;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return reset_status;
+        }
     }
     else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RUN )
     {
-        if ( !L )
+        vm_instance* inst = &vm::instances[ 0 ];
+        if ( !inst->active || !inst->L )
         {
             irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
             irp->IoStatus.Information = 0;
@@ -302,6 +273,7 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
             }
             req->code = ( char* ) ( req + 1 );
             req->chunkname = req->code + code_len + 1;
+            req->instance = inst;
             memcpy( req->code, code, code_len + 1 );
             memcpy( req->chunkname, chunkname, name_len_out + 1 );
             KeInitializeEvent( &req->done_event, NotificationEvent, FALSE );
@@ -414,6 +386,258 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
             return log_status;
         }
     }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_LIST )
+    {
+        void* buf = irp->AssociatedIrp.SystemBuffer;
+        size_t out_len = sp->Parameters.DeviceIoControl.OutputBufferLength;
+        if ( !buf || out_len < sizeof( ntlua_instance_list_out ) )
+        {
+            irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INVALID_PARAMETER;
+        }
+        ntlua_instance_list_out* out = ( ntlua_instance_list_out* ) buf;
+        RtlZeroMemory( out, sizeof( *out ) );
+        for ( int i = 0; i < vm::MAX_INSTANCES; i++ )
+        {
+            if ( vm::instances[ i ].active )
+            {
+                out->ids[ out->count ] = ( unsigned int ) i;
+                out->worker_running[ out->count ] = vm::instances[ i ].worker_running ? 1 : 0;
+                out->count++;
+            }
+        }
+        irp->IoStatus.Information = sizeof( ntlua_instance_list_out );
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_CREATE )
+    {
+        vm_instance* inst = vm::alloc();
+        if ( !inst )
+        {
+            irp->IoStatus.Status = STATUS_TOO_MANY_COMMANDS;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_TOO_MANY_COMMANDS;
+        }
+
+        inst->log_session = vm::create_session();
+        inst->L = lua::init();
+        if ( !inst->L )
+        {
+            vm::destroy_session( inst->log_session );
+            inst->log_session = nullptr;
+            vm::free( inst );
+            irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        lua::set_context_owner( inst->L, inst );
+        lua::expose_api( inst->L );
+        callback::expose_api( inst->L );
+        vm::start_worker( inst );
+
+        unsigned int new_id = inst->id;
+        void* buf = irp->AssociatedIrp.SystemBuffer;
+        if ( buf && sp->Parameters.DeviceIoControl.OutputBufferLength >= sizeof( unsigned int ) )
+        {
+            *( unsigned int* ) buf = new_id;
+            irp->IoStatus.Information = sizeof( unsigned int );
+        }
+        else
+        {
+            irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_DESTROY )
+    {
+        void* buf = irp->AssociatedIrp.SystemBuffer;
+        if ( !buf || sp->Parameters.DeviceIoControl.InputBufferLength < sizeof( unsigned int ) )
+        {
+            irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        unsigned int id = *( unsigned int* ) buf;
+        vm_instance* inst = vm::by_id( id );
+        if ( !inst )
+        {
+            irp->IoStatus.Status = STATUS_NOT_FOUND;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_NOT_FOUND;
+        }
+
+        unique_lock _g{ inst->lock };
+        callback::run_teardown( inst );
+        callback::destroy( inst );
+        lua::destroy( inst->L );
+        inst->L = nullptr;
+        vm::destroy_session( inst->log_session );
+        inst->log_session = nullptr;
+        vm::free( inst );
+        irp->IoStatus.Information = 0;
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_WORKER_CTL )
+    {
+        void* buf = irp->AssociatedIrp.SystemBuffer;
+        if ( !buf || sp->Parameters.DeviceIoControl.InputBufferLength < sizeof( ntlua_instance_worker_ctl ) )
+        {
+            irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INVALID_PARAMETER;
+        }
+        ntlua_instance_worker_ctl* in = ( ntlua_instance_worker_ctl* ) buf;
+        vm_instance* inst = vm::by_id( in->id );
+        if ( !inst )
+        {
+            irp->IoStatus.Status = STATUS_NOT_FOUND;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_NOT_FOUND;
+        }
+        // Set under the instance lock so a concurrent worker thread reads a
+        // consistent value (the thread reads worker_running outside the lock
+        // for its off-sleep, but only the off-sleep branch cares; the lock
+        // acquire on the next poll iteration provides the memory barrier).
+        //
+        unique_lock _g{ inst->lock };
+        inst->worker_running = ( in->enable != 0 );
+        irp->IoStatus.Information = 0;
+    }
+    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_RUN )
+    {
+        void* buf = irp->AssociatedIrp.SystemBuffer;
+        size_t in_len = sp->Parameters.DeviceIoControl.InputBufferLength;
+        if ( !buf || in_len <= sizeof( ntlua_instance_run_in ) )
+        {
+            irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        ntlua_instance_run_in* in = ( ntlua_instance_run_in* ) buf;
+        vm_instance* inst = vm::by_id( in->id );
+        if ( !inst || !inst->L )
+        {
+            irp->IoStatus.Status = STATUS_NOT_FOUND;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_NOT_FOUND;
+        }
+
+        const char* code = in->code;
+        const char* chunkname = "instance";
+        size_t avail = in_len - sizeof( ntlua_instance_run_in );
+        size_t name_len = 0;
+        while ( name_len < avail && in->code[ name_len ] != 0 )
+            name_len++;
+        if ( name_len + 1 < avail )
+        {
+            chunkname = in->code;
+            code = in->code + name_len + 1;
+        }
+
+        size_t code_len = strlen( code );
+        size_t name_len_out = strlen( chunkname );
+        execution_request* req = ( execution_request* ) malloc(
+            sizeof( execution_request ) + code_len + 1 + name_len_out + 1 );
+        if ( !req )
+        {
+            irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        req->code = ( char* ) ( req + 1 );
+        req->chunkname = req->code + code_len + 1;
+        req->instance = inst;
+        memcpy( req->code, code, code_len + 1 );
+        memcpy( req->chunkname, chunkname, name_len_out + 1 );
+        KeInitializeEvent( &req->done_event, NotificationEvent, FALSE );
+        KeInitializeEvent( &req->consumed_event, NotificationEvent, FALSE );
+        KeInitializeEvent( &req->abort_event, NotificationEvent, FALSE );
+
+        HANDLE thread_handle = nullptr;
+        NTSTATUS create_status = PsCreateSystemThread(
+            &thread_handle, 0, nullptr, nullptr, nullptr, &vm_execution_worker, req );
+        if ( !NT_SUCCESS( create_status ) )
+        {
+            free( req );
+            irp->IoStatus.Status = create_status;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return create_status;
+        }
+        if ( thread_handle ) ZwClose( thread_handle );
+
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -10000 * NTLUA_RUN_TIMEOUT_MS;
+        NTSTATUS wait_status = KeWaitForSingleObject(
+            &req->done_event, Executive, KernelMode, FALSE, &timeout );
+        if ( wait_status == STATUS_TIMEOUT )
+        {
+            KeSetEvent( &req->abort_event, IO_NO_INCREMENT, FALSE );
+            irp->IoStatus.Status = STATUS_TIMEOUT;
+            irp->IoStatus.Information = 0;
+            IoReleaseRemoveLock( &remove_lock, irp );
+            IoCompleteRequest( irp, IO_NO_INCREMENT );
+            return STATUS_TIMEOUT;
+        }
+
+        const auto export_to_um = [ ] ( captured_buffer& buf ) -> char*
+        {
+            if ( !buf.data )
+                return nullptr;
+            char* region = nullptr;
+            size_t size = buf.length + 1;
+            ZwAllocateVirtualMemory( NtCurrentProcess(), ( void** ) &region, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+            if ( region )
+            {
+                __try
+                {
+                    memcpy( region, buf.data, buf.length );
+                    region[ buf.length ] = 0;
+                }
+                __except ( 1 )
+                {
+                    region = nullptr;
+                }
+            }
+            return region;
+        };
+
+        size_t out_len = sp->Parameters.DeviceIoControl.OutputBufferLength;
+        if ( out_len >= sizeof( ntlua_instance_run_out ) )
+        {
+            ntlua_instance_run_out* out = ( ntlua_instance_run_out* ) buf;
+            out->errors  = export_to_um( req->errors_copy );
+            out->outputs = export_to_um( req->outputs_copy );
+        }
+        KeSetEvent( &req->consumed_event, IO_NO_INCREMENT, FALSE );
+        irp->IoStatus.Information = sizeof( ntlua_instance_run_out );
+    }
     else
     {
         // Report failure.
@@ -442,12 +666,14 @@ void unload_driver( PDRIVER_OBJECT driver )
     //
     callback::begin_teardown();
 
-    // Destroy the Lua context.
+    // Destroy all VM instances (each runs its own teardown, then its Lua
+    // state and session are freed).
     //
-    unique_lock _g{ LL };
-    callback::run_teardown( L );
-    callback::destroy( L );
-    lua::destroy( L );
+    vm::shutdown();
+
+    // Logger must be freed after all instances (they may still hold the
+    // global session on instance 0). See vm::destroy_session.
+    //
     logger::shutdown();
 
     // Delete the symbolic link.
@@ -502,11 +728,12 @@ extern "C" NTSTATUS DriverEntry( DRIVER_OBJECT* DriverObject, UNICODE_STRING* Re
     //
     log_ring::init();
 
-    // Initialize the VM lock before any IOCTL or callback can touch it.
+    // Initialize the universal callback bridge (trampoline table, rundown,
+    // registry spinlock). Must precede any instance that registers callbacks.
     //
-    LL.init();
+    callback::init();
 
-    // Create a device object.
+    // Create the device object.
     //
     UNICODE_STRING device_name;
     RtlInitUnicodeString( &device_name, L"\\Device\\NtLua" );
@@ -545,20 +772,15 @@ extern "C" NTSTATUS DriverEntry( DRIVER_OBJECT* DriverObject, UNICODE_STRING* Re
         return nt_status;
     }
 
-    // Initialize Lua.
+    // Create the default instance (instance 0): Lua state, API, instance
+    // ownership and callback API.
     //
-    L = lua::init();
-    if ( !L )
+    vm::init();
+    if ( !vm::instances[ 0 ].active || !vm::instances[ 0 ].L )
     {
         IoDeleteSymbolicLink( &dos_device );
         IoDeleteDevice( device_object );
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    lua::expose_api( L );
-
-    // Initialize the universal callback bridge.
-    //
-    callback::init();
-    callback::expose_api( L );
     return STATUS_SUCCESS;
 }

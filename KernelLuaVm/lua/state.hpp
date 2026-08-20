@@ -30,6 +30,12 @@ namespace lua
         static constexpr int64_t EXECUTION_HOOK_STEP = 100000;       // hook fires every N instructions
         static constexpr int64_t EXECUTION_BUDGET    = 1000000000LL; // default budget per work unit
         int64_t budget_remaining = 0;
+
+        // Owning vm_instance (raw pointer, null for states created outside
+        // the pool). Used to route callback ownership and per-instance state.
+        // void* to avoid a circular include with vm.hpp.
+        //
+        void* vm_owner = nullptr;
     };
 
     // Initializes a Lua state.
@@ -44,9 +50,20 @@ namespace lua
     //
     lua_context* get_context( lua_State* L );
 
+    // Records the owning vm_instance for a state (void* to avoid the
+    // vm.hpp circular include).
+    //
+    void set_context_owner( lua_State* L, void* owner );
+
     // Executes code in given Lua state.
     //
     void execute( lua_State* L, const char* code, bool user_input = false, const char* chunkname = "line" );
+
+    // Run the per-instance worker poll: "if worker then worker() end".
+    // Returns true if the worker function was called and returned without
+    // error; false if there was no global `worker` or it raised.
+    //
+    bool poll_worker( lua_State* L );
 };
 
 // Some helpers we need in Lua style.

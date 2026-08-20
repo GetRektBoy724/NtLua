@@ -128,6 +128,11 @@ namespace lua
         return ( lua_context* ) ctx;
     }
 
+    void set_context_owner( lua_State* L, void* owner )
+    {
+        get_context( L )->vm_owner = owner;
+    }
+
     // Error handler passed to lua_pcall: appends a full stack traceback to the
     // error message so runtime errors report the call stack with line numbers
     // instead of a bare message.
@@ -235,6 +240,69 @@ namespace lua
 
         context->panic_active = 0;
         context->panic_owner = nullptr;
+    }
+
+    bool poll_worker( lua_State* L )
+    {
+        if ( !L )
+            return false;
+
+        // Same discipline as execute: give the work unit a fresh instruction
+        // budget (a stale one - or the initial 0 - makes the count hook error
+        // out immediately), and guard against Lua panic.
+        //
+        lua_context* context = lua::get_context( L );
+        context->budget_remaining = lua_context::EXECUTION_BUDGET;
+        context->panic_owner = ( void* ) KeGetCurrentThread();
+        context->panic_active = 1;
+
+        int entry = lua_gettop( L );
+
+        if ( setjmp( context->panic_jump ) == 0 )
+        {
+            __try
+            {
+                lua_getglobal( L, "worker" );
+                bool called = !lua_isnil( L, -1 );
+                if ( !called )
+                {
+                    lua_pop( L, 1 );
+                    context->panic_active = 0;
+                    context->panic_owner = nullptr;
+                    lua_settop( L, entry );
+                    return false;
+                }
+
+                int status = lua_pcall( L, 0, 0, 0 );
+                if ( status )
+                {
+                    const char* msg = lua_tostring( L, -1 );
+                    logger::error( "worker: %s\n", msg ? msg : "(non-string error)" );
+                    lua_pop( L, 1 );
+                }
+                lua_settop( L, entry );
+                context->panic_active = 0;
+                context->panic_owner = nullptr;
+                return status == 0;
+            }
+            __except ( 1 )
+            {
+                logger::error( "worker: SEH error: %x\n", GetExceptionCode() );
+                lua_settop( L, entry );
+                context->panic_active = 0;
+                context->panic_owner = nullptr;
+                return false;
+            }
+        }
+        else
+        {
+            trace::push( NTLUA_TRK_TRAP, "worker panic", 0, nullptr, 0 );
+            logger::error( "worker: Lua panic (budget or runtime)" );
+            lua_settop( L, entry );
+            context->panic_active = 0;
+            context->panic_owner = nullptr;
+            return false;
+        }
     }
 };
 

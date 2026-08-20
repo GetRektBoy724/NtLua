@@ -1,5 +1,7 @@
 #include "api.hpp"
 #include <ntimage.h>
+#include "state.hpp"
+#include "../vm.hpp"
 
 extern "C" {
     __declspec( dllimport ) void RtlPcToFileHeader( void* a1, IMAGE_DOS_HEADER** a2 );
@@ -66,17 +68,23 @@ static int l_memcmp( lua_State* L )
 //
 static int l_attach_process( lua_State* L )
 {
-    lua_pushunsigned( L, lua::attach_process( ( PEPROCESS ) lua_tounsigned( L, 1 ) ) ? 1 : 0 );
+    vm_instance* inst = vm::lua_owner( L );
+    bool ok = inst && vm::attach_process( inst, ( PEPROCESS ) lua_tounsigned( L, 1 ) );
+    lua_pushunsigned( L, ok ? 1 : 0 );
     return 1;
 }
 static int l_attach_pid( lua_State* L )
 {
-    lua_pushunsigned( L, lua::attach_pid( lua_tounsigned( L, 1 ) ) ? 1 : 0 );
+    vm_instance* inst = vm::lua_owner( L );
+    bool ok = inst && vm::attach_pid( inst, lua_tounsigned( L, 1 ) );
+    lua_pushunsigned( L, ok ? 1 : 0 );
     return 1;
 }
 static int l_detach( lua_State* L )
 {
-    lua_pushunsigned( L, lua::detach() ? 1 : 0 );
+    vm_instance* inst = vm::lua_owner( L );
+    bool ok = inst && vm::detach( inst );
+    lua_pushunsigned( L, ok ? 1 : 0 );
     return 1;
 }
 

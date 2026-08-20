@@ -150,6 +150,7 @@
     <ClCompile Include="lua\callback.cpp" />
     <ClCompile Include="lua\native_function.cpp" />
     <ClCompile Include="lua\state.cpp" />
+    <ClCompile Include="vm.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
