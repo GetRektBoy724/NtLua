@@ -9,22 +9,24 @@ local function hex(v)
     return string.format("0x%016X", v & 0xFFFFFFFFFFFFFFFF)
 end
 
-local function read_cstring(addr)
-    if addr == 0 then return "?" end
-    local chars = {}
-    for i = 0, 254 do
-        local b = read1(addr + i)
-        if b == 0 then break end
-        chars[#chars + 1] = string.char(b)
-    end
-    return table.concat(chars)
-end
-
 local deref = nt.ObfDereferenceObject or nt.ObDereferenceObject
 local proc_buf = tmp(8)
 
+-- SeLocateProcessImageName returns a full UNICODE_STRING path (e.g.
+-- "\Device\HarddiskVolume3\Windows\System32\OpenConsole.exe"). We cannot use
+-- PsGetProcessImageFileName: it reads the fixed 15-byte EPROCESS.ImageFileName
+-- buffer, so names longer than 14 chars come back truncated (e.g.
+-- "OpenConsole.ex"). SeLocateProcessImageName allocates the UNICODE_STRING with
+-- ExAllocatePoolWithTag; the caller must free it.
+--
+local UNICODE_STRING = struct.define {
+    Length        = { 0x00, 2 },
+    MaximumLength = { 0x02, 2 },
+    Buffer        = { 0x08, 8 },
+}
+
 local function get_process_name(pid)
-    if not nt.PsLookupProcessByProcessId or not nt.PsGetProcessImageFileName then
+    if not nt.PsLookupProcessByProcessId or not nt.SeLocateProcessImageName then
         return nil
     end
     proc_buf:set(0)
@@ -32,10 +34,27 @@ local function get_process_name(pid)
     if status ~= 0 then return nil end
     local eproc = proc_buf:get()
     if eproc == 0 then return nil end
-    local name_ptr = nt.PsGetProcessImageFileName(eproc)
-    local name = read_cstring(name_ptr)
+
+    local unicode_ptr = tmp(8)
+    unicode_ptr:set(0)
+    status = nt.SeLocateProcessImageName(eproc, unicode_ptr:ref())
     if deref then deref(eproc) end
-    return name
+    if status ~= 0 then return nil end
+
+    local us = UNICODE_STRING( unicode_ptr:get() )
+    if not us then return nil end
+    local len = us.Length
+    local buf = us.Buffer
+    if buf == 0 or len == 0 then return nil end
+
+    local chars = {}
+    for i = 0, (len // 2) - 1 do
+        local w = read2(buf + i * 2)
+        if w == 0 then break end
+        chars[#chars + 1] = string.char(w & 0xFF)   -- ASCII-compatible path chars
+    end
+    free(buf)
+    return table.concat(chars)
 end
 
 -- === State ===

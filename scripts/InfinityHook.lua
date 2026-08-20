@@ -143,8 +143,13 @@ local function resolve_routine(name)
     return fn
 end
 
--- KTHREAD.PreviousMode offset (varies by Windows version). Found by
--- comparing read1(thread + offset) with ExGetPreviousMode().
+-- KTHREAD.PreviousMode offset (varies by Windows version). Parsed from the
+-- ExGetPreviousMode prologue instead of probed by writes: byte-probing is
+-- ambiguous when the current thread is in KernelMode (0) -- e.g. on the
+-- driver's system worker thread -- because writing 0 to any already-zero
+-- byte cannot be told apart from writing to PreviousMode itself, so the
+-- scan latches onto the first zero byte (KTHREAD+0x1) instead of the real
+-- field.
 local pm_off = nil
 
 local function find_pm_off()
@@ -156,22 +161,42 @@ local function find_pm_off()
         print("[scan] ExGetPreviousMode not found")
         return nil
     end
-    local pm = expm()
-    print("[scan] PreviousMode value = " .. pm .. " (thread=" .. hex(thread) .. ")")
+    local expected = expm()
+    print("[scan] PreviousMode value = " .. expected .. " (thread=" .. hex(thread) .. ")")
 
-    for off = 0x00, 0x300 do
-        if read1(thread + off) == pm then
-            write1(thread + off, 0)
-            if expm() == 0 then
-                write1(thread + off, pm)
-                pm_off = off
-                print("[scan] PreviousMode at KTHREAD+0x" .. string.format("%X", off))
-                return pm_off
-            end
-            write1(thread + off, pm)
+    -- ExGetPreviousMode is a tiny stub on every NT build:
+    --   mov rax, gs:188h                    ; current KTHREAD
+    --   mov al,  byte ptr [rax+XXh]         ; or movzx eax, byte ptr [rax+XXh]
+    --   retn
+    -- Both encodings end in a byte load from [rax+disp]; the disp is the
+    -- PreviousMode offset. Sanity-check each candidate against the live
+    -- thread before accepting it.
+    --
+    local expm_addr = expm:address()
+    local off = nil
+    for i = 0, 32 do
+        local b0 = read1(expm_addr + i)
+        local b1 = read1(expm_addr + i + 1)
+        if b0 == 0x8A then
+            -- mov al, byte ptr [rax+disp]
+            if b1 == 0x80 then off = read4(expm_addr + i + 2)
+            elseif b1 == 0x40 then off = read1(expm_addr + i + 2) end
+        elseif b0 == 0x0F and b1 == 0xB6 then
+            -- movzx eax, byte ptr [rax+disp]
+            local b2 = read1(expm_addr + i + 2)
+            if b2 == 0x80 then off = read4(expm_addr + i + 3)
+            elseif b2 == 0x40 then off = read1(expm_addr + i + 3) end
+        else
+            off = nil
+        end
+        if off and read1(thread + off) == expected then
+            pm_off = off
+            print("[scan] PreviousMode at KTHREAD+0x" .. string.format("%X", off)
+                  .. " (from ExGetPreviousMode prologue)")
+            return pm_off
         end
     end
-    print("[scan] PreviousMode offset not found in range 0x00-0x300")
+    print("[scan] could not parse ExGetPreviousMode prologue (offset not found)")
     return nil
 end
 

@@ -75,7 +75,7 @@ struct ntlua_trace_ctl_in
 // can show live driver/script output without DbgView - the same sequence
 // protocol (last_seq -> next_seq + dropped) as the trace ring.
 //
-#define NTLUA_LOG_ENTRY_LEN 200
+#define NTLUA_LOG_ENTRY_LEN 512
 #define NTLUA_LOG_ENTRIES   256
 
 struct ntlua_log_entry

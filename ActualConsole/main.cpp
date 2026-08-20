@@ -347,6 +347,31 @@ int main( int argc, const char** argv )
                 }
             }
         }
+        else if ( buffer.rfind( "load ", 0 ) == 0 )
+        {
+            std::string path = buffer.substr( 5 );
+            size_t start = path.find_first_not_of( " \t" );
+            if ( start == std::string::npos )
+            {
+                printf( "usage: load <file>\n" );
+            }
+            else
+            {
+                path = path.substr( start );
+                std::ifstream fs( path );
+                if ( !fs )
+                {
+                    printf( "could not open '%s'\n", path.c_str() );
+                }
+                else
+                {
+                    std::string src{ std::istreambuf_iterator<char>( fs ), {} };
+                    printf( "loaded '%s' (%zu bytes) on instance %u\n",
+                            path.c_str(), src.size(), active_instance );
+                    execute_on_instance( active_instance, src.data(), false, path.c_str() );
+                }
+            }
+        }
         else if ( buffer == "trace on" || buffer == "trace off" )
         {
             ntlua_trace_ctl_in ctl = {};
