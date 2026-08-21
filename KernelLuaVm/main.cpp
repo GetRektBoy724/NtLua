@@ -4,12 +4,13 @@
 #include "logger.hpp"
 #include "trace_ring.hpp"
 #include "log_ring.hpp"
-#include "vm.hpp"
+#include "lua/vm.hpp"
 #include "lua/state.hpp"
 #include "lua/native_function.hpp"
 #include "driver_io.hpp"
 #include "lua/api.hpp"
 #include "lua/callback.hpp"
+#include "lua/ioctl.hpp"
 
 #pragma intrinsic(_enable)
 
@@ -67,34 +68,58 @@ static VOID NTAPI vm_execution_worker( PVOID start_context )
         {
             vm::begin_ctx( inst );
             logger::route_begin( inst->log_session );
+
+            // Snapshot the write position before running the chunk so the
+            // return value contains ONLY this chunk's output. Output produced
+            // in between chunks - by a worker poll or a callback firing while
+            // the instance lock was free - is dropped from the session here
+            // (it already reached the tail log ring via fwrite) instead of
+            // leaking into the next REPL return.
+            //
+            size_t logs_start   = 0;
+            size_t errors_start = 0;
+            if ( inst->log_session )
+            {
+                logs_start   = inst->log_session->logs.iterator;
+                errors_start = inst->log_session->errors.iterator;
+            }
+
             lua::execute( inst->L, req->code, true, req->chunkname );
             logger::route_end();
             vm::end_ctx( inst );
 
-            // Capture only the output produced since the last capture
-            // (watermark), so print() from callbacks that fire between
-            // chunks is preserved instead of wiped by the next chunk.
+            // Capture only [start, iterator): the bytes this chunk wrote.
+            // Then consume the whole buffer so pre-chunk output (worker /
+            // callback prints) can never surface in a later REPL return.
             //
-            const auto capture = [ ] ( logger::string_buffer& buf ) -> captured_buffer
+            const auto capture = [ ] ( logger::string_buffer& buf, size_t start ) -> captured_buffer
             {
                 captured_buffer out;
-                size_t avail = buf.iterator - buf.read_pos;
+                size_t avail = buf.iterator - start;
                 if ( avail )
                 {
                     out.data = ( char* ) malloc( avail + 1 );
                     if ( out.data )
                     {
-                        out.length = buf.capture_delta( out.data, avail );
+                        memcpy( out.data, buf.raw + start, avail );
+                        out.length = avail;
                         out.data[ out.length ] = 0;
                     }
+                }
+
+                buf.read_pos = buf.iterator;
+                if ( buf.read_pos >= buf.buffer_length / 2 )
+                {
+                    buf.iterator = 0;
+                    buf.read_pos = 0;
                 }
                 return out;
             };
 
             if ( inst->log_session )
             {
-                req->errors_copy  = capture( inst->log_session->errors );
-                req->outputs_copy = capture( inst->log_session->logs );
+                req->errors_copy  = capture( inst->log_session->errors, errors_start );
+                req->outputs_copy = capture( inst->log_session->logs, logs_start );
             }
 
             // Flush any trailing partial line (print() without a newline) so
@@ -153,6 +178,7 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
         lua::expose_api( inst->L );
         callback::init();
         callback::expose_api( inst->L );
+        ioctl::expose_api( inst->L );
         return STATUS_SUCCESS;
     };
 
@@ -313,33 +339,37 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
                 return STATUS_TIMEOUT;
             }
 
-            // Export the captured output into user-mode memory; the worker
-            // is parked on consumed_event and frees the buffers after this.
-            //
-            const auto export_to_um = [ ] ( captured_buffer& buf ) -> char*
+// Export the captured output into user-mode memory; the worker
+        // is parked on consumed_event and frees the buffers after this.
+        //
+        const auto export_to_um = [ ] ( captured_buffer& buf ) -> char*
+        {
+            if ( !buf.data )
+                return nullptr;
+
+            char* region = nullptr;
+            size_t size = buf.length + 1;
+            ZwAllocateVirtualMemory( NtCurrentProcess(), ( void** ) &region, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+
+            if ( region )
             {
-                if ( !buf.data )
-                    return nullptr;
-
-                char* region = nullptr;
-                size_t size = buf.length + 1;
-                ZwAllocateVirtualMemory( NtCurrentProcess(), ( void** ) &region, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
-
-                if ( region )
+                __try
                 {
-                    __try
-                    {
-                        memcpy( region, buf.data, buf.length );
-                        region[ buf.length ] = 0;
-                    }
-                    __except ( 1 )
-                    {
-
-                    }
+                    memcpy( region, buf.data, buf.length );
+                    region[ buf.length ] = 0;
                 }
-
-                return region;
-            };
+                __except ( 1 )
+                {
+                    region = nullptr;
+                }
+            }
+            // Free the captured source after copying: it is owned by the
+            // request and would otherwise leak per execution (non-paged pool).
+            //
+            free( buf.data );
+            buf.data = nullptr;
+            return region;
+        };
 
             if ( output_length >= sizeof( ntlua_result ) )
             {
@@ -440,6 +470,7 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
         lua::set_context_owner( inst->L, inst );
         lua::expose_api( inst->L );
         callback::expose_api( inst->L );
+        ioctl::expose_api( inst->L );
         vm::start_worker( inst );
 
         unsigned int new_id = inst->id;
@@ -625,6 +656,11 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
                     region = nullptr;
                 }
             }
+            // Free the captured source after copying: it is owned by the
+            // request and would otherwise leak per execution (non-paged pool).
+            //
+            free( buf.data );
+            buf.data = nullptr;
             return region;
         };
 
@@ -640,12 +676,19 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
     }
     else
     {
-        // Report failure.
+        // Script-registered IOCTL handlers (nt.register_ioctl). Every code
+        // that is not a built-in NTLUA_* code lands here: if a script has
+        // claimed it, the driver runs the handler and completes the IRP with
+        // the handler's status/output; otherwise the default is
+        // STATUS_INVALID_DEVICE_REQUEST. ioctl::dispatch sets
+        // IoStatus.Status/Information but leaves the remove-lock release and
+        // IRP completion to us, like every other branch.
         //
-        irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
+        ioctl::dispatch( irp, sp );
+
         IoReleaseRemoveLock( &remove_lock, irp );
         IoCompleteRequest( irp, IO_NO_INCREMENT );
-        return STATUS_UNSUCCESSFUL;
+        return irp->IoStatus.Status;
     }
 
     // Declare success and return.

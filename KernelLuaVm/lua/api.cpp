@@ -1,7 +1,7 @@
 #include "api.hpp"
 #include <ntimage.h>
 #include "state.hpp"
-#include "../vm.hpp"
+#include "vm.hpp"
 
 extern "C" {
     __declspec( dllimport ) void RtlPcToFileHeader( void* a1, IMAGE_DOS_HEADER** a2 );

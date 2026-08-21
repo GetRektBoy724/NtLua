@@ -1,8 +1,9 @@
 #include "callback.hpp"
 #include "../logger.hpp"
 #include "../trace_ring.hpp"
-#include "../vm.hpp"
+#include "vm.hpp"
 #include "native_function.hpp"
+#include "ioctl.hpp"
 
 // - Admission gate ISA -
 // Events may carry a compiled predicate program (policy-as-data, authored in
@@ -594,7 +595,15 @@ namespace callback
 
     void init()
     {
-        KeInitializeSpinLock( &cb_registry_lock );
+        // Idempotent: see ioctl::init. Re-initialising this lock from
+        // reset_instance while a concurrent dispatch holds it corrupts it.
+        //
+        static bool lock_initialized = false;
+        if ( !lock_initialized )
+        {
+            KeInitializeSpinLock( &cb_registry_lock );
+            lock_initialized = true;
+        }
         if ( callback_rundown_initialized )
             ExReInitializeRundownProtection( &callback_rundown );
         else
@@ -626,6 +635,8 @@ namespace callback
         #define TRAMP( N ) cb_trampoline_table[N] = (void*) &capture_tramp<N>;
         #include "../trampolines.inc"
         #undef TRAMP
+
+        ioctl::init();
     }
 
     void begin_teardown()
@@ -648,25 +659,68 @@ namespace callback
 
         ExRundownCompleted( &callback_rundown );
         ExWaitForRundownProtectionRelease( &callback_rundown );
+
+        // Drop script-authored IOCTL handlers too: with the callback bridge
+        // quiesced no dispatch can be mid-handler, so the registry is safe to
+        // clear here.
+        //
+        ioctl::begin_teardown();
     }
 
     void run_teardown( vm_instance* inst )
     {
         lua_State* Ls = inst->L;
-        int base = lua_gettop( Ls );
-        for ( int i = 0; i < vm_instance::MAX_TEARDOWN_CALLBACKS; i++ )
-        {
-            if ( inst->teardown_refs[ i ] == LUA_NOREF )
-                continue;
+        if ( !Ls )
+            return;
 
-            lua_rawgeti( Ls, LUA_REGISTRYINDEX, inst->teardown_refs[ i ] );
-            if ( lua_pcall( Ls, 0, 0, 0 ) )
+        lua::lua_context* context = lua::get_context( Ls );
+        context->panic_owner = ( void* ) KeGetCurrentThread();
+        context->panic_active = 1;
+
+        int base = lua_gettop( Ls );
+
+        // Teardown callbacks are ordinary scripts (arbitrary FFI calls), so
+        // they get the same containment as execute()/run_handler: budget,
+        // panic guard and SEH - a faulting callback must not bugcheck the
+        // machine during unload or reset.
+        //
+        if ( setjmp( context->panic_jump ) == 0 )
+        {
+            for ( int i = 0; i < vm_instance::MAX_TEARDOWN_CALLBACKS; i++ )
             {
-                const char* message = lua_tostring( Ls, -1 );
-                logger::error( "teardown %d: %s\n", i, message ? message : "(non-string error object)" );
+                if ( inst->teardown_refs[ i ] == LUA_NOREF )
+                    continue;
+
+                // Fresh budget per callback: the chunk that triggered this
+                // teardown may have drained it, which would kill every
+                // callback on its first VM instruction.
+                //
+                context->budget_remaining = lua::lua_context::EXECUTION_BUDGET;
+
+                __try
+                {
+                    lua_rawgeti( Ls, LUA_REGISTRYINDEX, inst->teardown_refs[ i ] );
+                    if ( lua_pcall( Ls, 0, 0, 0 ) )
+                    {
+                        const char* message = lua_tostring( Ls, -1 );
+                        logger::error( "teardown %d: %s\n", i, message ? message : "(non-string error object)" );
+                    }
+                }
+                __except ( 1 )
+                {
+                    logger::error( "teardown %d SEH: %x\n", i, GetExceptionCode() );
+                }
+                lua_settop( Ls, base );
             }
+        }
+        else
+        {
+            logger::error( "teardown panic\n" );
             lua_settop( Ls, base );
         }
+
+        context->panic_active = 0;
+        context->panic_owner = nullptr;
     }
 
     void destroy( vm_instance* inst )
@@ -707,6 +761,12 @@ namespace callback
             if ( refs[ i ] != LUA_NOREF )
                 luaL_unref( Ls, LUA_REGISTRYINDEX, refs[ i ] );
         }
+
+        // Drop this instance's script-authored IOCTL handlers too, releasing
+        // their registry references. Must run while Ls is still valid (the
+        // caller destroys the Lua state immediately after this).
+        //
+        ioctl::destroy( inst );
 
         if ( !restore_all_patches( inst ) )
             logger::error( "tracked patch restoration fault\n" );
@@ -772,8 +832,6 @@ namespace callback
             return luaL_error( Ls, "invalid event_id %d", event_id );
         if ( arg_count_value > 16 )
             return luaL_error( Ls, "arg_count must be between 0 and 16" );
-        if ( cb_registry[ event_id ].owner != inst )
-            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
 
         // Push the Lua function (arg 3) and ref it in the registry.
         // Done at PASSIVE_LEVEL (called from REPL via IOCTL, the instance
@@ -783,10 +841,19 @@ namespace callback
         int new_ref = luaL_ref( Ls, LUA_REGISTRYINDEX );
 
         // Atomically swap the ref, arg_count and flags under the registry
-        // spinlock.
+        // spinlock. Ownership is checked under the same lock: a concurrent
+        // FreeEvent / destroy / teardown can change ownership after an
+        // unlocked check, which would install this handler on a slot the
+        // instance no longer owns.
         //
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
+        if ( cb_registry[ event_id ].owner != inst || !accepting_teardown )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            luaL_unref( Ls, LUA_REGISTRYINDEX, new_ref );
+            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
+        }
         int old_ref = cb_registry[ event_id ].lua_ref;
         cb_registry[ event_id ].lua_ref   = new_ref;
         cb_registry[ event_id ].arg_count = (uint8_t) arg_count;
@@ -814,12 +881,31 @@ namespace callback
 
     static int free_event( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return 0;
+
         int event_id = (int) luaL_checkunsigned( Ls, 1 );
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return 0;
 
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
+
+        // Ownership: only the instance that allocated the event may free it.
+        // This is the gate that makes the global registry safe to share: an
+        // instance can never mutate another's slot, so a cross-instance call
+        // can't unref a ref number on the wrong Lua state (which corrupts the
+        // caller's registry free list). Checked under the lock so a concurrent
+        // destroy/teardown cannot change ownership between the check and the
+        // mutation.
+        //
+        if ( cb_registry[ event_id ].owner != inst || !accepting_teardown )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return 0;
+        }
+
         int ref = cb_registry[ event_id ].lua_ref;
         cb_registry[ event_id ].owner    = nullptr;
         cb_registry[ event_id ].lua_ref = LUA_NOREF;
@@ -848,6 +934,10 @@ namespace callback
     //
     static int set_fallback( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         int event_id = (int) luaL_checkunsigned( Ls, 1 );
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return luaL_error( Ls, "invalid event_id %d", event_id );
@@ -879,6 +969,11 @@ namespace callback
 
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
+        if ( cb_registry[ event_id ].owner != inst || !accepting_teardown )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
+        }
         cb_registry[ event_id ].fallback_address = address;
         cb_registry[ event_id ].fallback_ret_width = width;
         KeReleaseSpinLock( &cb_registry_lock, old );
@@ -888,6 +983,10 @@ namespace callback
 
     static int set_fallback_value( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         int event_id = (int) luaL_checkunsigned( Ls, 1 );
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return luaL_error( Ls, "invalid event_id %d", event_id );
@@ -896,6 +995,11 @@ namespace callback
 
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
+        if ( cb_registry[ event_id ].owner != inst || !accepting_teardown )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
+        }
         cb_registry[ event_id ].fallback_value = value;
         KeReleaseSpinLock( &cb_registry_lock, old );
 
@@ -904,12 +1008,21 @@ namespace callback
 
     static int clear_fallback( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         int event_id = (int) luaL_checkunsigned( Ls, 1 );
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return luaL_error( Ls, "invalid event_id %d", event_id );
 
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
+        if ( cb_registry[ event_id ].owner != inst || !accepting_teardown )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
+        }
         cb_registry[ event_id ].fallback_address = nullptr;
         cb_registry[ event_id ].fallback_ret_width = 8;
         cb_registry[ event_id ].fallback_value = 0;
@@ -1083,6 +1196,10 @@ namespace callback
     //
     static int set_gate( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         int event_id = (int) luaL_checkunsigned( Ls, 1 );
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return luaL_error( Ls, "invalid event_id %d", event_id );
@@ -1091,6 +1208,11 @@ namespace callback
         {
             KIRQL old;
             KeAcquireSpinLock( &cb_registry_lock, &old );
+            if ( cb_registry[ event_id ].owner != inst || !accepting_teardown )
+            {
+                KeReleaseSpinLock( &cb_registry_lock, old );
+                return luaL_error( Ls, "event %d is not owned by this instance", event_id );
+            }
             InterlockedIncrement64( &cb_registry[ event_id ].gate_seq );
             cb_registry[ event_id ].gate_len = 0;
             InterlockedIncrement64( &cb_registry[ event_id ].gate_seq );
@@ -1140,6 +1262,11 @@ namespace callback
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
         callback_registration& reg = cb_registry[ event_id ];
+        if ( reg.owner != inst || !accepting_teardown )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
+        }
         InterlockedIncrement64( &reg.gate_seq );
         memcpy( reg.gate_instrs, staged, words * sizeof( uint64_t ) );
         reg.gate_len = count;
@@ -1155,6 +1282,10 @@ namespace callback
     //
     static int set_wait( lua_State* Ls )
     {
+        vm_instance* inst = vm::lua_owner( Ls );
+        if ( !inst )
+            return luaL_error( Ls, "no owning vm instance" );
+
         int event_id = (int) luaL_checkunsigned( Ls, 1 );
         if ( event_id < 0 || event_id >= MAX_EVENTS )
             return luaL_error( Ls, "invalid event_id %d", event_id );
@@ -1170,6 +1301,11 @@ namespace callback
 
         KIRQL old;
         KeAcquireSpinLock( &cb_registry_lock, &old );
+        if ( cb_registry[ event_id ].owner != inst || !accepting_teardown )
+        {
+            KeReleaseSpinLock( &cb_registry_lock, old );
+            return luaL_error( Ls, "event %d is not owned by this instance", event_id );
+        }
         cb_registry[ event_id ].wait_ms = ms;
         KeReleaseSpinLock( &cb_registry_lock, old );
         return 0;

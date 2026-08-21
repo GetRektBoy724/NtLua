@@ -1,7 +1,8 @@
 #include "vm.hpp"
-#include "lua/state.hpp"
-#include "lua/api.hpp"
-#include "lua/callback.hpp"
+#include "state.hpp"
+#include "api.hpp"
+#include "callback.hpp"
+#include "ioctl.hpp"
 
 #include <intrin.h>
 #pragma intrinsic(_enable)
@@ -330,6 +331,7 @@ namespace vm
         lua::expose_api( inst->L );
         lua::set_context_owner( inst->L, inst );
         callback::expose_api( inst->L );
+        ioctl::expose_api( inst->L );
         start_worker( inst );
     }
 

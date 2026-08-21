@@ -1,7 +1,7 @@
 #pragma once
 #include <ntifs.h>
-#include "logger.hpp"
-#include "lua/callback.hpp"
+#include "../logger.hpp"
+#include "callback.hpp"
 
 // A kernel memory write tracked for restoration (was file-local in callback.cpp).
 //

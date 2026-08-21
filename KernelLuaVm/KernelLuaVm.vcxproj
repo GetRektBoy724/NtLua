@@ -81,6 +81,7 @@
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <AdditionalOptions>/Oi- /Gs10000000 %(AdditionalOptions)</AdditionalOptions>
+      <WarningLevel>Level1</WarningLevel>
     </ClCompile>
     <Link>
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
@@ -148,9 +149,10 @@
     <ClCompile Include="crt\misc.c" />
     <ClCompile Include="lua\api.cpp" />
     <ClCompile Include="lua\callback.cpp" />
+    <ClCompile Include="lua\ioctl.cpp" />
     <ClCompile Include="lua\native_function.cpp" />
     <ClCompile Include="lua\state.cpp" />
-    <ClCompile Include="vm.cpp" />
+    <ClCompile Include="lua\vm.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -164,8 +166,10 @@
     <ClInclude Include="logger.hpp" />
     <ClInclude Include="lua\api.hpp" />
     <ClInclude Include="lua\callback.hpp" />
+    <ClInclude Include="lua\ioctl.hpp" />
     <ClInclude Include="lua\native_function.hpp" />
     <ClInclude Include="lua\state.hpp" />
+    <ClInclude Include="lua\vm.hpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="runtime\runtime.lua" />
