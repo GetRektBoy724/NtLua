@@ -16,17 +16,25 @@ native_function* native_function::push( lua_State* L )
 
 // Constructor.
 //
+// Validate arguments BEFORE push(): the pushed userdata would otherwise sit
+// at index 2, making the optional-width check inspect our own userdata on
+// every single-argument call ("number expected, got native_function").
+//
 int native_function::create( lua_State* L )
 {
-    native_function* fn = push( L );
-    fn->address = ( void* ) luaL_checkunsigned( L, 1 );
+    uint64_t addr = luaL_checkunsigned( L, 1 );
+
+    int w = 8;
     if ( !lua_isnoneornil( L, 2 ) )
     {
-        int w = ( int ) luaL_checkunsigned( L, 2 );
+        w = ( int ) luaL_checkunsigned( L, 2 );
         if ( w != 1 && w != 2 && w != 4 && w != 8 )
             return luaL_error( L, "ret_width must be 1, 2, 4 or 8, got %d", w );
-        fn->ret_width = ( uint8_t ) w;
     }
+
+    native_function* fn = push( L );
+    fn->address = ( void* ) addr;
+    fn->ret_width = ( uint8_t ) w;
     return 1;
 }
 

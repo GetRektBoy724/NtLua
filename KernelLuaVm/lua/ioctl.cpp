@@ -29,8 +29,7 @@ static bool is_reserved_code( uint32_t code )
 {
     switch ( code )
     {
-        case NTLUA_RUN: case NTLUA_RESET: case NTLUA_TAIL_TRACE:
-        case NTLUA_TRACE_CTL: case NTLUA_TAIL_LOG:
+        case NTLUA_TAIL_TRACE: case NTLUA_TRACE_CTL: case NTLUA_TAIL_LOG:
         case NTLUA_INSTANCE_CREATE: case NTLUA_INSTANCE_DESTROY:
         case NTLUA_INSTANCE_LIST: case NTLUA_INSTANCE_RUN:
         case NTLUA_INSTANCE_RESET: case NTLUA_INSTANCE_WORKER_CTL:

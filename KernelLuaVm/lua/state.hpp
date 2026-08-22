@@ -25,7 +25,7 @@ namespace lua
         // callback handler, the hook raises a Lua error inside the enclosing
         // lua_pcall instead of wedging the VM lock forever. A blocked native
         // FFI call consumes no instructions, so main.cpp's bounded execution
-        // thread (NTLUA_RUN) covers that case.
+        // thread covers that case.
         //
         static constexpr int64_t EXECUTION_HOOK_STEP = 100000;       // hook fires every N instructions
         static constexpr int64_t EXECUTION_BUDGET    = 1000000000LL; // default budget per work unit

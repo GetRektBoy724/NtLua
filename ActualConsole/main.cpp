@@ -138,6 +138,154 @@ static bool execute_on_instance( unsigned int id, const char* str, bool silent, 
     return true;
 }
 
+// Runs one chunk and hands the captured output/error text to the caller
+// (the driver exports them into our address space; we must free them).
+//
+static bool run_chunk_capture( unsigned int id, const std::string& src, const char* chunkname,
+                               std::string& out_outputs, std::string& out_errors )
+{
+    std::string run_payload;
+    if ( chunkname && *chunkname )
+    {
+        run_payload = chunkname;
+        run_payload += '\0';
+    }
+    run_payload += src;
+    run_payload += '\0';
+
+    auto* in = ( ntlua_instance_run_in* ) malloc( sizeof( ntlua_instance_run_in ) - 1 + run_payload.size() );
+    if ( !in )
+        return false;
+    in->id = id;
+    memcpy( in->code, run_payload.data(), run_payload.size() );
+
+    ntlua_instance_run_out out = {};
+    DWORD discarded = 0;
+    DWORD in_len = ( DWORD )( sizeof( ntlua_instance_run_in ) - 1 + run_payload.size() );
+    bool ok = DeviceIoControl( device, NTLUA_INSTANCE_RUN, in, in_len, &out, sizeof( out ), &discarded, nullptr );
+    free( in );
+    if ( !ok )
+        return false;
+
+    if ( out.outputs ) out_outputs = out.outputs;
+    if ( out.errors ) out_errors = out.errors;
+    if ( out.outputs ) VirtualFree( out.outputs, 0, MEM_RELEASE );
+    if ( out.errors ) VirtualFree( out.errors, 0, MEM_RELEASE );
+    return true;
+}
+
+static bool read_file( const std::string& path, std::string& out )
+{
+    std::ifstream fs( path );
+    if ( !fs )
+        return false;
+    out.assign( std::istreambuf_iterator<char>( fs ), {} );
+    return true;
+}
+
+// - Regression test runner -
+//
+// 'test'            -> load framework.lua, then every test_*.lua next to it
+// 'test <name>'     -> run only scripts\tests\test_<name>.lua
+//
+// Each test file's captured output is parsed for the framework's RESULT
+// line ("RESULT <p> pass, <f> fail[, <s> skipped]") to build the summary.
+//
+static void run_tests( const std::string& dir, const std::string& only )
+{
+    const std::string fw_path = dir + "\\framework.lua";
+    std::string fw_src;
+    if ( !read_file( fw_path, fw_src ) )
+    {
+        printf( "could not open '%s'\n", fw_path.c_str() );
+        return;
+    }
+
+    std::vector<std::string> files;
+    if ( !only.empty() )
+    {
+        files.push_back( dir + "\\test_" + only + ".lua" );
+    }
+    else
+    {
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA( ( dir + "\\test_*.lua" ).c_str(), &fd );
+        if ( h == INVALID_HANDLE_VALUE )
+        {
+            printf( "no test_*.lua files in '%s'\n", dir.c_str() );
+            return;
+        }
+        do
+        {
+            files.push_back( dir + "\\" + fd.cFileName );
+        } while ( FindNextFileA( h, &fd ) );
+        FindClose( h );
+    }
+
+    std::string outputs, errors;
+    int total_pass = 0, total_fail = 0, total_skip = 0, file_fail = 0;
+
+    for ( const std::string& path : files )
+    {
+        std::string src;
+        if ( !read_file( path, src ) )
+        {
+            printf( "[MISS] %s (could not open)\n", path.c_str() );
+            file_fail++;
+            continue;
+        }
+
+        // Reload the framework before each file: it resets T's counters so
+        // each RESULT line reflects exactly one file (globals persist across
+        // chunks on the same instance).
+        //
+        if ( !run_chunk_capture( active_instance, fw_src, fw_path.c_str(), outputs, errors ) )
+        {
+            printf( "[ERR ] framework failed to execute\n" );
+            file_fail++;
+            continue;
+        }
+
+        std::string epilogue = src + "\nT.summary()\n";
+        outputs.clear();
+        errors.clear();
+        if ( !run_chunk_capture( active_instance, epilogue, path.c_str(), outputs, errors ) )
+        {
+            printf( "[ERR ] %s (IOCTL failed)\n", path.c_str() );
+            file_fail++;
+            continue;
+        }
+
+        int p = 0, f = 0, s = 0;
+        const char* r = strstr( outputs.c_str(), "RESULT " );
+        if ( !r || sscanf_s( r, "RESULT %d pass, %d fail, %d skipped", &p, &f, &s ) != 3 )
+        {
+            // No RESULT line or unparseable: the file never ran its tests.
+            p = s = 0;
+            f = 1;
+        }
+
+        if ( !errors.empty() )
+        {
+            // A chunk-level error (syntax, or T itself broken) is a failure.
+            f += 1;
+            printf( "%s", errors.c_str() );
+        }
+
+        total_pass += p;
+        total_fail += f;
+        total_skip += s;
+        printf( "%s %s  (%d pass, %d fail, %d skipped)\n",
+                f == 0 ? "[PASS]" : "[FAIL]", path.c_str(), p, f, s );
+        if ( f > 0 && !outputs.empty() )
+            printf( "%s", outputs.c_str() );
+    }
+
+    printf( "\ntests: %d files, %d pass, %d fail, %d skipped%s\n",
+            ( int ) files.size(), total_pass, total_fail, total_skip,
+            ( total_fail == 0 && file_fail == 0 ) ? "  [ALL PASS]" : "  [FAILURES]" );
+}
+
 // - CLI argument parsing -
 //
 // Form: ntlua.exe [id] script.lua [more.lua ...]
@@ -370,6 +518,18 @@ int main( int argc, const char** argv )
                             path.c_str(), src.size(), active_instance );
                     execute_on_instance( active_instance, src.data(), false, path.c_str() );
                 }
+            }
+        }
+        else if ( buffer == "test" || buffer.rfind( "test ", 0 ) == 0 )
+        {
+            std::string arg = ( buffer.size() > 5 ) ? buffer.substr( 5 ) : "";
+            if ( arg.find( ':' ) != std::string::npos || arg.find( '\\' ) != std::string::npos )
+            {
+                printf( "usage: test [name]   (runs scripts\\tests\\test_<name>.lua)\n" );
+            }
+            else
+            {
+                run_tests( "scripts\\tests", arg );
             }
         }
         else if ( buffer == "trace on" || buffer == "trace off" )

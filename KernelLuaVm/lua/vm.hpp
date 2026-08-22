@@ -77,8 +77,8 @@ namespace vm
     //
     extern vm_instance instances[ MAX_INSTANCES ];
 
-    // Only instance 0 exists after this; it IS the legacy "global" VM so
-    // NTLUA_RUN / NTLUA_RESET keep working unchanged.
+    // Only instance 0 exists after this; it IS the legacy "global" VM,
+    // addressed as instance 0 through the NTLUA_INSTANCE_* IOCTLs.
     //
     void init();
 

@@ -1,8 +1,6 @@
 #pragma once
 
 // Assuming the platform specific header is included already.
-#define NTLUA_RUN   CTL_CODE( 0x13, 0x37, METHOD_BUFFERED, FILE_ANY_ACCESS )
-#define NTLUA_RESET CTL_CODE( 0x13, 0x38, METHOD_BUFFERED, FILE_ANY_ACCESS )
 #define NTLUA_TAIL_TRACE CTL_CODE( 0x13, 0x39, METHOD_BUFFERED, FILE_ANY_ACCESS )
 #define NTLUA_TRACE_CTL  CTL_CODE( 0x13, 0x3A, METHOD_BUFFERED, FILE_ANY_ACCESS )
 #define NTLUA_TAIL_LOG   CTL_CODE( 0x13, 0x3B, METHOD_BUFFERED, FILE_ANY_ACCESS )
@@ -12,14 +10,6 @@
 #define NTLUA_INSTANCE_RUN     CTL_CODE( 0x13, 0x3F, METHOD_BUFFERED, FILE_ANY_ACCESS )
 #define NTLUA_INSTANCE_RESET   CTL_CODE( 0x13, 0x40, METHOD_BUFFERED, FILE_ANY_ACCESS )
 #define NTLUA_INSTANCE_WORKER_CTL CTL_CODE( 0x13, 0x41, METHOD_BUFFERED, FILE_ANY_ACCESS )
-
-// Shared structures.
-//
-struct ntlua_result
-{
-    char* errors;
-    char* outputs;
-};
 
 // Trace ring: records every host-import invocation plus CALL/RETURN/TRAP
 // around chunk and callback execution while tracing is enabled. Polled with
@@ -98,7 +88,7 @@ struct ntlua_log_out
 };
 
 // Instance pool: create/destroy/list/run against independent VMs. Instance 0
-// is the legacy "global" VM; NTLUA_RUN always targets it.
+// is the legacy "global" VM, addressed as instance 0.
 //
 #define NTLUA_MAX_INSTANCES 4
 

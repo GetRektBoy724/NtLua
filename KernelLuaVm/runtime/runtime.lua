@@ -65,7 +65,9 @@ R"(
     end
     
     function unicode_string(str)
-        local UnicodeString = tmp(0x10 + (#str*2))
+        -- +2 for the null terminator written by the inclusive copy loop below;
+        -- without it the terminator overflows the pool block by 2 bytes.
+        local UnicodeString = tmp(0x10 + (#str*2) + 2)
         write4(UnicodeString:ref(), 0x10001 * (#str*2))
         write8(UnicodeString:ref() + 8, UnicodeString:ref() + 0x10)
         

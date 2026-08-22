@@ -18,11 +18,11 @@
 //
 IO_REMOVE_LOCK remove_lock = {};
 
-// Bounded wait for a NTLUA_RUN chunk. A script wedged inside a blocking
-// native FFI call can never be preempted (the instruction hook only fires
-// between Lua instructions), so the IRP gives up after this long; the
-// execution thread keeps running in the background and aborts via the
-// instruction budget the moment control returns to Lua.
+// Bounded wait for a chunk execution (NTLUA_INSTANCE_RUN). A script wedged
+// inside a blocking native FFI call can never be preempted (the instruction
+// hook only fires between Lua instructions), so the IRP gives up after this
+// long; the execution thread keeps running in the background and aborts via
+// the instruction budget the moment control returns to Lua.
 //
 static constexpr LONGLONG NTLUA_RUN_TIMEOUT_MS = 30000;
 
@@ -32,8 +32,8 @@ struct captured_buffer
     size_t length = 0;
 };
 
-// One NTLUA_RUN request. Allocated as a single pool block with the code and
-// chunk name appended; owned by the execution thread, which frees it after
+// One chunk-execution request. Allocated as a single pool block with the code
+// and chunk name appended; owned by the execution thread, which frees it after
 // the caller has either consumed the results or given up (abort).
 //
 struct execution_request
@@ -48,8 +48,8 @@ struct execution_request
     KEVENT abort_event;               // caller timed out / gave up
 };
 
-// Executes one chunk on its own system thread so the NTLUA_RUN IOCTL can
-// bound the wait. Runs under the instance's lock exactly like the old inline
+// Executes one chunk on its own system thread so the caller can bound the
+// wait. Runs under the instance's lock exactly like the old inline
 // path, then hands the captured output to the caller and only frees the
 // request once the caller has consumed it or signalled abort.
 //
@@ -184,32 +184,7 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
 
     // Handle the command.
     //
-    if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RESET )
-    {
-        vm_instance* inst = &vm::instances[ 0 ];
-        if ( !inst->active )
-        {
-            irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
-            irp->IoStatus.Information = 0;
-            IoReleaseRemoveLock( &remove_lock, irp );
-            IoCompleteRequest( irp, IO_NO_INCREMENT );
-            return STATUS_DEVICE_NOT_READY;
-        }
-        // Legacy reset additionally shuts down the callback bridge globally
-        // (trampolines become no-ops) before re-initialising instance 0.
-        //
-        callback::begin_teardown();
-        NTSTATUS reset_status = reset_instance( inst );
-        if ( !NT_SUCCESS( reset_status ) )
-        {
-            irp->IoStatus.Status = reset_status;
-            irp->IoStatus.Information = 0;
-            IoReleaseRemoveLock( &remove_lock, irp );
-            IoCompleteRequest( irp, IO_NO_INCREMENT );
-            return reset_status;
-        }
-    }
-    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_RESET )
+    if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_INSTANCE_RESET )
     {
         void* buf = irp->AssociatedIrp.SystemBuffer;
         if ( !buf || sp->Parameters.DeviceIoControl.InputBufferLength < sizeof( unsigned int ) )
@@ -238,146 +213,6 @@ NTSTATUS device_control( PDEVICE_OBJECT device_object, PIRP irp )
             IoReleaseRemoveLock( &remove_lock, irp );
             IoCompleteRequest( irp, IO_NO_INCREMENT );
             return reset_status;
-        }
-    }
-    else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_RUN )
-    {
-        vm_instance* inst = &vm::instances[ 0 ];
-        if ( !inst->active || !inst->L )
-        {
-            irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
-            irp->IoStatus.Information = 0;
-            IoReleaseRemoveLock( &remove_lock, irp );
-            IoCompleteRequest( irp, IO_NO_INCREMENT );
-            return STATUS_DEVICE_NOT_READY;
-        }
-
-        const char* input = ( const char* ) irp->AssociatedIrp.SystemBuffer;
-        ntlua_result* result = ( ntlua_result* ) irp->AssociatedIrp.SystemBuffer;
-
-        size_t input_length = sp->Parameters.DeviceIoControl.InputBufferLength;
-        size_t output_length = sp->Parameters.DeviceIoControl.OutputBufferLength;
-
-        // Begin output size at 0.
-        //
-        irp->IoStatus.Information = 0;
-
-        // If there is a valid, null-terminated buffer:
-        //
-        if ( input && input_length && input[ input_length - 1 ] == 0x0 )
-        {
-            // An optional chunk name may prefix the code as "name\0code\0";
-            // when present it is used as the Lua chunk name so errors and
-            // tracebacks report the real script path instead of "line".
-            //
-            const char* code = input;
-            const char* chunkname = "line";
-            size_t name_len = 0;
-            while ( name_len < input_length && input[ name_len ] != 0 )
-                name_len++;
-            if ( name_len + 1 < input_length )
-            {
-                chunkname = input;
-                code = input + name_len + 1;
-            }
-
-            // Copy the input into the request before spawning the thread: the
-            // worker outlives this IRP on the timeout path and must never
-            // touch SystemBuffer again once the IRP has completed.
-            //
-            size_t code_len = strlen( code );
-            size_t name_len_out = strlen( chunkname );
-            execution_request* req = ( execution_request* ) malloc(
-                sizeof( execution_request ) + code_len + 1 + name_len_out + 1 );
-            if ( !req )
-            {
-                irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
-                irp->IoStatus.Information = 0;
-                IoReleaseRemoveLock( &remove_lock, irp );
-                IoCompleteRequest( irp, IO_NO_INCREMENT );
-                return STATUS_INSUFFICIENT_RESOURCES;
-            }
-            req->code = ( char* ) ( req + 1 );
-            req->chunkname = req->code + code_len + 1;
-            req->instance = inst;
-            memcpy( req->code, code, code_len + 1 );
-            memcpy( req->chunkname, chunkname, name_len_out + 1 );
-            KeInitializeEvent( &req->done_event, NotificationEvent, FALSE );
-            KeInitializeEvent( &req->consumed_event, NotificationEvent, FALSE );
-            KeInitializeEvent( &req->abort_event, NotificationEvent, FALSE );
-
-            HANDLE thread_handle = nullptr;
-            NTSTATUS create_status = PsCreateSystemThread(
-                &thread_handle, 0, nullptr, nullptr, nullptr, &vm_execution_worker, req );
-            if ( !NT_SUCCESS( create_status ) )
-            {
-                free( req );
-                irp->IoStatus.Status = create_status;
-                irp->IoStatus.Information = 0;
-                IoReleaseRemoveLock( &remove_lock, irp );
-                IoCompleteRequest( irp, IO_NO_INCREMENT );
-                return create_status;
-            }
-            if ( thread_handle ) ZwClose( thread_handle );
-
-            // Bound the wait. On timeout the IRP completes while the worker
-            // keeps running in the background; abort tells it to free its
-            // request without touching this IRP.
-            //
-            LARGE_INTEGER timeout;
-            timeout.QuadPart = -10000 * NTLUA_RUN_TIMEOUT_MS;
-            NTSTATUS wait_status = KeWaitForSingleObject(
-                &req->done_event, Executive, KernelMode, FALSE, &timeout );
-
-            if ( wait_status == STATUS_TIMEOUT )
-            {
-                KeSetEvent( &req->abort_event, IO_NO_INCREMENT, FALSE );
-                irp->IoStatus.Status = STATUS_TIMEOUT;
-                irp->IoStatus.Information = 0;
-                IoReleaseRemoveLock( &remove_lock, irp );
-                IoCompleteRequest( irp, IO_NO_INCREMENT );
-                return STATUS_TIMEOUT;
-            }
-
-// Export the captured output into user-mode memory; the worker
-        // is parked on consumed_event and frees the buffers after this.
-        //
-        const auto export_to_um = [ ] ( captured_buffer& buf ) -> char*
-        {
-            if ( !buf.data )
-                return nullptr;
-
-            char* region = nullptr;
-            size_t size = buf.length + 1;
-            ZwAllocateVirtualMemory( NtCurrentProcess(), ( void** ) &region, 0, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
-
-            if ( region )
-            {
-                __try
-                {
-                    memcpy( region, buf.data, buf.length );
-                    region[ buf.length ] = 0;
-                }
-                __except ( 1 )
-                {
-                    region = nullptr;
-                }
-            }
-            // Free the captured source after copying: it is owned by the
-            // request and would otherwise leak per execution (non-paged pool).
-            //
-            free( buf.data );
-            buf.data = nullptr;
-            return region;
-        };
-
-            if ( output_length >= sizeof( ntlua_result ) )
-            {
-                result->errors  = export_to_um( req->errors_copy );
-                result->outputs = export_to_um( req->outputs_copy );
-                irp->IoStatus.Information = sizeof( ntlua_result );
-            }
-            KeSetEvent( &req->consumed_event, IO_NO_INCREMENT, FALSE );
         }
     }
     else if ( sp->Parameters.DeviceIoControl.IoControlCode == NTLUA_TAIL_TRACE )

@@ -10,9 +10,9 @@
 // - Instance pool -
 //
 // Fixed pool of up to MAX_INSTANCES independent Lua VMs. Instance 0 is the
-// legacy "global" VM (NTLUA_RUN / NTLUA_RESET target it); its log session is
-// the pool-backed `logger::global` session. Instances 1..N-1 get their own
-// pool-allocated sessions and are managed via NTLUA_INSTANCE_*.
+// legacy "global" VM; its log session is the pool-backed `logger::global`
+// session. Instances 1..N-1 get their own pool-allocated sessions and are
+// managed via NTLUA_INSTANCE_*.
 //
 namespace vm
 {

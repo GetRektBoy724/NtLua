@@ -40,7 +40,7 @@ The normal execution path is:
 ```text
 ntlua.exe
     -> \Device\NtLua
-    -> NTLUA_RUN IOCTL
+    -> NTLUA_INSTANCE_RUN IOCTL
     -> driver input parser
     -> lua::execute()
     -> Lua API / script
@@ -111,22 +111,24 @@ arbitrary script remain the script author's responsibility.
 
 ## Execution and Lifecycle
 
-### `NTLUA_RUN`
+### `NTLUA_INSTANCE_RUN`
 
-`NTLUA_RUN` is a buffered IOCTL. The console normally sends one of these
-payloads:
+`NTLUA_INSTANCE_RUN` is a buffered IOCTL that executes a chunk on the target
+instance. The console normally sends one of these payloads:
 
 ```text
-script-name\0lua-source\0
+[instance-id u32][script-name\0lua-source\0]
 ```
 
-The driver splits the first NUL-separated field into the Lua chunk name. The
-chunk name appears in parser errors and stack tracebacks. If no name prefix is
-present, the fallback name is `line`.
+The driver splits the first NUL-separated field after the instance id into the
+Lua chunk name. The chunk name appears in parser errors and stack tracebacks.
+If no name prefix is present, the fallback name is `instance`.
 
-The driver resets the logger buffers at the beginning of a run, executes the
-chunk, copies the error/output buffers into the caller's address space, and
-completes the IRP.
+The driver executes the chunk on a dedicated system thread with a bounded wait
+(30s), copies the error/output buffers into the caller's address space, and
+completes the IRP. The execution thread keeps running in the background if the
+caller times out, aborting via the instruction budget the moment control
+returns to Lua.
 
 The console's `print()` output is captured in the output buffer. Runtime and
 parser failures are captured in the error buffer.
@@ -134,19 +136,15 @@ parser failures are captured in the error buffer.
 `print` is the standard Lua base-library function. Its stdout writes are
 intercepted by the driver's custom CRT: `fwrite` appends to `logger::logs`
 (output buffer) for stdout and to `logger::errors` (error buffer) for stderr.
-Both buffers are reset at the start of every run, so output from a previous
-execution is not carried into the next.
 
-### `NTLUA_RESET`
+### `NTLUA_INSTANCE_RESET`
 
-Reset performs an ordered VM reset:
+`NTLUA_INSTANCE_RESET` performs an ordered reset of a single instance:
 
-1. Stop accepting new callback dispatches.
-2. Wait for in-flight callback trampolines through rundown protection.
-3. Run registered `OnTeardown` callbacks while the old Lua state is valid.
-4. Restore tracked patches and clear callback references.
-5. Destroy the old Lua state.
-6. Create a new Lua state and expose all built-ins again.
+1. Run registered `OnTeardown` callbacks while the old Lua state is valid.
+2. Restore tracked patches and clear callback references.
+3. Destroy the old Lua state.
+4. Create a new Lua state and expose all built-ins again.
 
 Hooks do not survive reset. Scripts must install them again after reset.
 

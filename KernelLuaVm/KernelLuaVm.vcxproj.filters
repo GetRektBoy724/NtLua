@@ -161,6 +161,7 @@
     <ClCompile Include="lua\vm.cpp">
       <Filter>lua</Filter>
     </ClCompile>
+    <ClCompile Include="lua\ioctl.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Filter Include="crt">
@@ -206,6 +207,7 @@
     <ClInclude Include="lua\vm.hpp">
       <Filter>lua</Filter>
     </ClInclude>
+    <ClInclude Include="lua\ioctl.hpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="runtime\runtime.lua">
